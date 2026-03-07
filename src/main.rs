@@ -2,7 +2,7 @@ mod server;
 mod tools;
 
 use anyhow::{Context, Result};
-use elisym_core::AgentNodeBuilder;
+use elisym_core::{AgentNodeBuilder, SolanaPaymentConfig, SolanaPaymentProvider, SolanaNetwork, SolanaToken};
 use rmcp::{ServiceExt, transport::stdio};
 use serde::Deserialize;
 use tracing_subscriber::{self, EnvFilter};
@@ -19,7 +19,27 @@ struct AgentConfig {
     #[serde(default)]
     relays: Vec<String>,
     secret_key: String,
+    #[serde(default)]
+    payment: Option<PaymentSection>,
 }
+
+#[derive(Deserialize)]
+struct PaymentSection {
+    #[serde(default = "default_chain")]
+    chain: String,
+    #[serde(default = "default_network")]
+    network: String,
+    #[serde(default)]
+    rpc_url: Option<String>,
+    #[serde(default = "default_token")]
+    token: String,
+    #[serde(default)]
+    solana_secret_key: String,
+}
+
+fn default_chain() -> String { "solana".into() }
+fn default_network() -> String { "devnet".into() }
+fn default_token() -> String { "sol".into() }
 
 fn load_agent_config(name: &str) -> Result<AgentConfig> {
     let home = dirs::home_dir().context("Cannot find home directory")?;
@@ -33,6 +53,41 @@ fn load_agent_config(name: &str) -> Result<AgentConfig> {
     let config: AgentConfig =
         toml::from_str(&contents).with_context(|| format!("Invalid config for agent '{}'", name))?;
     Ok(config)
+}
+
+fn build_solana_provider(payment: &PaymentSection) -> Option<SolanaPaymentProvider> {
+    if payment.chain != "solana" || payment.solana_secret_key.is_empty() {
+        return None;
+    }
+
+    let network = match payment.network.as_str() {
+        "mainnet" => SolanaNetwork::Mainnet,
+        "testnet" => SolanaNetwork::Testnet,
+        "devnet" => SolanaNetwork::Devnet,
+        custom => SolanaNetwork::Custom(custom.to_string()),
+    };
+
+    let token = match payment.token.as_str() {
+        "sol" => SolanaToken::Sol,
+        _ => SolanaToken::Sol, // default to SOL for now
+    };
+
+    let config = SolanaPaymentConfig {
+        network,
+        rpc_url: payment.rpc_url.clone(),
+        token,
+    };
+
+    match SolanaPaymentProvider::from_secret_key(config, &payment.solana_secret_key) {
+        Ok(provider) => {
+            tracing::info!(address = %provider.address(), "Solana wallet configured");
+            Some(provider)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to initialize Solana wallet: {e}");
+            None
+        }
+    }
 }
 
 fn list_agents() -> Vec<String> {
@@ -79,6 +134,14 @@ async fn main() -> Result<()> {
         if !config.relays.is_empty() {
             b = b.relays(config.relays);
         }
+
+        // Configure Solana payments if available
+        if let Some(ref payment) = config.payment {
+            if let Some(provider) = build_solana_provider(payment) {
+                b = b.solana_payment_provider(provider);
+            }
+        }
+
         b
     } else {
         let agent_name =
@@ -112,7 +175,11 @@ async fn main() -> Result<()> {
     };
 
     let agent = builder.build().await?;
-    tracing::info!(npub = %agent.identity.npub(), "Agent node started");
+    tracing::info!(
+        npub = %agent.identity.npub(),
+        payments = agent.payments.is_some(),
+        "Agent node started"
+    );
 
     let server = ElisymServer::new(agent);
     let service = server

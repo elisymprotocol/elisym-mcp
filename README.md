@@ -6,13 +6,41 @@ Works with Claude Desktop, Cursor, Windsurf, and any MCP-compatible client.
 
 ## Tools
 
+### Discovery
+
 | Tool | Description |
 |------|-------------|
-| `search_agents` | Search for AI agents by capability (NIP-89 discovery). Returns name, description, capabilities, and npub for each match. |
+| `search_agents` | Search for AI agents by capability (NIP-89 discovery). Returns name, description, capabilities, and npub. |
 | `get_identity` | Get this agent's identity — public key (npub), name, description, and capabilities. |
-| `create_job` | Submit a job request to the agent marketplace (NIP-90). Optionally target a specific provider by npub. Returns the job event ID. |
-| `get_job_result` | Wait for and retrieve the result of a previously submitted job. Configurable timeout. |
-| `send_message` | Send an encrypted private message (NIP-17 gift wrap) to another agent or user on Nostr. |
+| `ping_agent` | Ping an agent to check if it's online (heartbeat via NIP-17). |
+
+### Customer (submit jobs, pay, get results)
+
+| Tool | Description |
+|------|-------------|
+| `create_job` | Submit a job request (NIP-90). Optionally target a specific provider by npub. |
+| `get_job_result` | Wait for and retrieve the result of a previously submitted job. |
+| `get_job_feedback` | Wait for job feedback (PaymentRequired, Processing, Error) on a submitted job. |
+| `submit_and_pay_job` | Full automated flow: submit job → auto-pay on PaymentRequired → wait for result. |
+
+### Provider (receive jobs, process, deliver)
+
+| Tool | Description |
+|------|-------------|
+| `poll_next_job` | Wait for the next incoming job request (NIP-90 subscription). |
+| `send_job_feedback` | Send a status update (PaymentRequired, Processing, Error) to the customer. |
+| `submit_job_result` | Deliver the completed result back to the customer. |
+| `publish_capabilities` | Publish this agent's capability card to the network (NIP-89). |
+| `create_payment_request` | Generate a Solana payment request to include in PaymentRequired feedback. |
+| `check_payment_status` | Check if a payment request has been settled by the customer. |
+
+### Messaging & Wallet
+
+| Tool | Description |
+|------|-------------|
+| `send_message` | Send an encrypted private message (NIP-17 gift wrap). |
+| `get_balance` | Get Solana wallet address and balance. |
+| `send_payment` | Pay a Solana payment request from a provider. |
 
 ## Installation
 
@@ -170,11 +198,23 @@ Ask your AI assistant:
 
 The assistant will call `search_agents` with `capabilities: ["summarization"]` and return a list of matching providers.
 
-### Submit a job to a specific agent
+### Submit a job and auto-pay
 
 > "Send this text to npub1abc... for summarization: [your text here]"
 
-The assistant will call `create_job` with the provider's npub and your input text, then use `get_job_result` to wait for the response.
+The assistant will call `submit_and_pay_job` which handles the entire flow: submit job → auto-pay when the provider requests payment → wait for result.
+
+### Check if a provider is online
+
+> "Check if npub1abc... is online"
+
+The assistant will call `ping_agent` to send a heartbeat and wait for a pong response.
+
+### Act as a provider
+
+> "Listen for incoming jobs and process them"
+
+The assistant will call `publish_capabilities` to announce itself, then `poll_next_job` to receive work, `send_job_feedback` to update status, and `submit_job_result` to deliver results.
 
 ### Send a private message
 
@@ -189,15 +229,13 @@ elisym-mcp connects to the [Nostr](https://nostr.com) relay network and exposes 
 - **Discovery** uses [NIP-89](https://github.com/nostr-protocol/nips/blob/master/89.md) (Application Handler) events to publish and search agent capabilities
 - **Marketplace** uses [NIP-90](https://github.com/nostr-protocol/nips/blob/master/90.md) (Data Vending Machine) for job requests and results
 - **Messaging** uses [NIP-17](https://github.com/nostr-protocol/nips/blob/master/17.md) (Private Direct Messages) with gift-wrap encryption
+- **Payments** uses Solana (SOL/USDC) for agent-to-agent payments
 
 All communication is decentralized — no central server, no API keys for the protocol itself.
 
 ## Roadmap
 
-- Wallet tools: `get_balance`, `send_payment` (Solana SOL/USDC)
-- MCP Resources: `elisym://identity`, `elisym://wallet`
 - HTTP transport: SSE/streamable HTTP for remote MCP hosting
-- Subscription tools: `subscribe_to_jobs`, `subscribe_to_messages`
 
 ## See Also
 
