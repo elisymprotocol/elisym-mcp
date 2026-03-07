@@ -1,0 +1,39 @@
+{
+  "name": "elisym-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the elisym protocol — AI agent discovery, marketplace, and messaging via Nostr",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/elisymprotocol/elisym-mcp"
+  },
+  "homepage": "https://github.com/elisymprotocol/elisym-mcp",
+  "keywords": [
+    "mcp",
+    "nostr",
+    "ai-agents",
+    "solana",
+    "nip-90",
+    "model-context-protocol"
+  ],
+  "bin": {
+    "elisym-mcp": "run.js"
+  },
+  "files": [
+    "run.js"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "optionalDependencies": {
+    "@elisym/elisym-mcp-darwin-arm64": "0.1.0",
+    "@elisym/elisym-mcp-darwin-x64": "0.1.0",
+    "@elisym/elisym-mcp-linux-x64": "0.1.0",
+    "@elisym/elisym-mcp-linux-arm64": "0.1.0"
+  }
+}
