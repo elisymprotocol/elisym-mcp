@@ -1,0 +1,8 @@
+Cargo.lock
+target/
+.DS_Store
+.idea/
+.vscode/
+.env.local
+temp/
+CLAUDE.md

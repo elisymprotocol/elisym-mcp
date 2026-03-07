@@ -1,0 +1,24 @@
+[package]
+name = "elisym-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "MCP server for the elisym protocol — AI agent discovery, marketplace, and payments via Nostr"
+license = "MIT"
+repository = "https://github.com/elisymprotocol/elisym-mcp"
+homepage = "https://github.com/elisymprotocol/elisym-mcp"
+readme = "README.md"
+keywords = ["mcp", "nostr", "ai-agents", "solana", "nip-90"]
+categories = ["network-programming"]
+
+[dependencies]
+elisym-core = { path = "../elisym-core", features = ["payments-solana"] }
+rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nostr-sdk = "0.37"
+anyhow = "1"
