@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use crate::tools::customer::{GetJobFeedbackInput, PingAgentInput, SubmitAndPayJobInput};
 use crate::tools::discovery::{AgentInfo, SearchAgentsInput};
 use crate::tools::marketplace::{CreateJobInput, GetJobResultInput};
-use crate::tools::messaging::SendMessageInput;
+use crate::tools::messaging::{ReceiveMessagesInput, SendMessageInput};
 use crate::tools::provider::{
     CheckPaymentStatusInput, CreatePaymentRequestInput, PollNextJobInput,
     PublishCapabilitiesInput, SendJobFeedbackInput, SubmitJobResultInput,
@@ -550,6 +550,60 @@ impl ElisymServer {
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error sending message: {e}"
             ))])),
+        }
+    }
+
+    #[tool(description = "Listen for incoming encrypted private messages (NIP-17). Collects messages until timeout or max count is reached, then returns them all.")]
+    async fn receive_messages(
+        &self,
+        Parameters(input): Parameters<ReceiveMessagesInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let timeout_secs = input.timeout_secs.unwrap_or(30);
+        let max_messages = input.max_messages.unwrap_or(10);
+
+        let mut rx = match self.agent.messaging.subscribe_to_messages().await {
+            Ok(rx) => rx,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error subscribing to messages: {e}"
+                ))]))
+            }
+        };
+
+        let mut messages = Vec::new();
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            tokio::select! {
+                Some(msg) = rx.recv() => {
+                    let sender_npub = msg.sender.to_bech32().unwrap_or_default();
+                    messages.push(serde_json::json!({
+                        "sender_npub": sender_npub,
+                        "content": msg.content,
+                        "timestamp": msg.timestamp.as_u64(),
+                    }));
+                    if messages.len() >= max_messages {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    break;
+                }
+            }
+        }
+
+        if messages.is_empty() {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "No messages received within {timeout_secs}s."
+            ))]))
+        } else {
+            let json = serde_json::to_string_pretty(&messages)
+                .unwrap_or_else(|e| format!("Error serializing messages: {e}"));
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "{} message(s) received:\n\n{json}",
+                messages.len()
+            ))]))
         }
     }
 

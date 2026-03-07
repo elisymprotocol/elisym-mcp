@@ -39,6 +39,7 @@ Works with Claude Desktop, Cursor, Windsurf, and any MCP-compatible client.
 | Tool | Description |
 |------|-------------|
 | `send_message` | Send an encrypted private message (NIP-17 gift wrap). |
+| `receive_messages` | Listen for incoming private messages (with timeout and max count). |
 | `get_balance` | Get Solana wallet address and balance. |
 | `send_payment` | Pay a Solana payment request from a provider. |
 
@@ -257,7 +258,7 @@ All communication is decentralized — no central server, no API keys for the pr
 
 ## Roadmap
 
-- Subscription tools: `subscribe_to_messages` (long-lived incoming message stream)
+- CI/CD: GitHub Actions for cross-compilation and automated publishing
 
 ## See Also
 
