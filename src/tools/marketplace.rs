@@ -36,6 +36,10 @@ pub struct GetJobResultInput {
     #[schemars(description = "Event ID (hex) of the job request")]
     pub job_event_id: String,
 
+    /// NIP-90 job kind offset (default: 100 for kind:6100 result).
+    #[schemars(description = "Job kind offset (default 100 for kind:6100)")]
+    pub kind_offset: Option<u16>,
+
     /// How long to wait for a result in seconds (default: 60).
     #[schemars(description = "Timeout in seconds to wait for a result (default: 60)")]
     pub timeout_secs: Option<u64>,

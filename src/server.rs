@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use elisym_core::{AgentFilter, AgentNode, PaymentProvider};
+use elisym_core::{
+    AgentFilter, AgentNode, PaymentProvider,
+    DEFAULT_KIND_OFFSET, KIND_JOB_RESULT_BASE, kind,
+};
 use nostr_sdk::prelude::*;
 use rmcp::{
     ServerHandler,
@@ -15,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::tools::customer::{GetJobFeedbackInput, PingAgentInput, SubmitAndPayJobInput};
+use crate::tools::dashboard::GetDashboardInput;
 use crate::tools::discovery::{AgentInfo, SearchAgentsInput};
 use crate::tools::marketplace::{CreateJobInput, GetJobResultInput};
 use crate::tools::messaging::{ReceiveMessagesInput, SendMessageInput};
@@ -23,6 +27,74 @@ use crate::tools::provider::{
     PublishCapabilitiesInput, SendJobFeedbackInput, SubmitJobResultInput,
 };
 use crate::tools::wallet::SendPaymentInput;
+
+/// Protocol fee in basis points (300 = 3%).
+const PROTOCOL_FEE_BPS: u64 = 300;
+/// Solana address of the protocol treasury.
+const PROTOCOL_TREASURY: &str = "GY7vnWMkKpftU4nQ16C2ATkj1JwrQpHhknkaBUn67VTy";
+
+/// Parsed Solana payment request for fee validation.
+#[derive(Debug, Deserialize)]
+struct SolanaPaymentRequestData {
+    #[allow(dead_code)]
+    recipient: String,
+    amount: u64,
+    #[allow(dead_code)]
+    reference: String,
+    fee_address: Option<String>,
+    fee_amount: Option<u64>,
+}
+
+/// Validate that a payment request has the correct protocol fee params.
+/// Returns an error message if invalid, None if OK.
+fn validate_payment_fee(request: &str) -> Option<String> {
+    let data: SolanaPaymentRequestData = match serde_json::from_str(request) {
+        Ok(d) => d,
+        Err(e) => return Some(format!("Invalid payment request JSON: {e}")),
+    };
+
+    let expected_fee = (data.amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+
+    match (data.fee_address.as_deref(), data.fee_amount) {
+        (Some(addr), Some(amt)) if amt > 0 => {
+            if addr != PROTOCOL_TREASURY {
+                return Some(format!(
+                    "Fee address mismatch: expected {PROTOCOL_TREASURY}, got {addr}. \
+                     Provider may be attempting to redirect fees."
+                ));
+            }
+            if amt != expected_fee {
+                return Some(format!(
+                    "Fee amount mismatch: expected {expected_fee} lamports ({}bps of {}), got {amt}. \
+                     Provider may be tampering with fee.",
+                    PROTOCOL_FEE_BPS, data.amount
+                ));
+            }
+            None
+        }
+        (None, None) => {
+            Some(format!(
+                "Payment request missing protocol fee ({PROTOCOL_FEE_BPS}bps). \
+                 Expected fee: {expected_fee} lamports to {PROTOCOL_TREASURY}."
+            ))
+        }
+        _ => Some(format!(
+            "Invalid fee params in payment request. \
+             Expected fee: {expected_fee} lamports to {PROTOCOL_TREASURY}."
+        )),
+    }
+}
+
+/// Truncate a string to `max` chars, appending "…" if truncated. UTF-8 safe.
+fn truncate_str(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > max {
+        let truncated: String = chars[..max.saturating_sub(1)].iter().collect();
+        format!("{truncated}…")
+    } else {
+        s.to_string()
+    }
+}
 
 /// Heartbeat message for ping/pong liveness checks (NIP-17 encrypted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +191,187 @@ impl ElisymServer {
             .unwrap_or_else(|e| format!("Error serializing identity: {e}"))
     }
 
+    #[tool(description = "Get a snapshot of the elisym network — top agents ranked by earnings, with total protocol earnings. Shows agent name, capabilities, price, and earned amount.")]
+    async fn get_dashboard(
+        &self,
+        Parameters(input): Parameters<GetDashboardInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let top_n = input.top_n.unwrap_or(10);
+        let timeout_secs = input.timeout_secs.unwrap_or(15);
+        let filter_chain = input.chain.unwrap_or_else(|| "solana".into());
+        let filter_network = input.network.unwrap_or_else(|| "devnet".into());
+
+        // 1. Discover all agents and filter by chain + network
+        let filter = elisym_core::AgentFilter::default();
+        let all_agents = match self.agent.discovery.search_agents(&filter).await {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error fetching agents: {e}"
+                ))]))
+            }
+        };
+        let agents: Vec<_> = all_agents
+            .into_iter()
+            .filter(|a| {
+                let chain = a.card.metadata.as_ref()
+                    .and_then(|m| m["chain"].as_str())
+                    .unwrap_or("solana");
+                let network = a.card.metadata.as_ref()
+                    .and_then(|m| m["network"].as_str())
+                    .unwrap_or("devnet");
+                chain.eq_ignore_ascii_case(&filter_chain)
+                    && network.eq_ignore_ascii_case(&filter_network)
+            })
+            .collect();
+
+        // Collect npubs of agents matching the network filter
+        let agent_npubs: std::collections::HashSet<String> = agents
+            .iter()
+            .filter_map(|a| a.pubkey.to_bech32().ok())
+            .collect();
+
+        // 2. Fetch job result events (kind 6100) to calculate earnings
+        //    Filter by author pubkeys to only get results from agents in this network.
+        let result_kind = kind(KIND_JOB_RESULT_BASE + DEFAULT_KIND_OFFSET);
+        let author_pks: Vec<PublicKey> = agents.iter().map(|a| a.pubkey).collect();
+        let event_filter = if author_pks.is_empty() {
+            nostr_sdk::Filter::new().kind(result_kind)
+        } else {
+            nostr_sdk::Filter::new().kind(result_kind).authors(author_pks)
+        };
+        let events = self
+            .agent
+            .client
+            .fetch_events(
+                vec![event_filter],
+                Some(std::time::Duration::from_secs(timeout_secs)),
+            )
+            .await;
+
+        // 3. Accumulate earnings per provider (only agents in this network)
+        let mut earnings: HashMap<String, u64> = HashMap::new();
+        let event_list = match &events {
+            Ok(ev) => ev.iter().collect::<Vec<_>>(),
+            Err(_) => vec![],
+        };
+        let mut total_job_results = 0usize;
+        for event in event_list.iter() {
+            let npub = event.pubkey.to_bech32().unwrap_or_default();
+            if !agent_npubs.contains(&npub) {
+                continue;
+            }
+            total_job_results += 1;
+            let amount = event.tags.iter().find_map(|tag| {
+                let s = tag.as_slice();
+                if s.first().map(|v| v.as_str()) == Some("amount") {
+                    s.get(1).and_then(|v| v.parse::<u64>().ok())
+                } else {
+                    None
+                }
+            });
+            if let Some(amt) = amount {
+                *earnings.entry(npub).or_insert(0) += amt;
+            }
+        }
+
+        // Total earned across ALL agents in this network
+        let total_earned_lamports: u64 = earnings.values().sum();
+        let total_earned_sol = total_earned_lamports as f64 / 1_000_000_000.0;
+
+        // 4. Build agent list with earnings, filter out observers
+        struct AgentRow {
+            name: String,
+            npub: String,
+            capabilities: String,
+            price: String,
+            earned: u64,
+        }
+
+        let mut rows: Vec<AgentRow> = agents
+            .iter()
+            .filter(|a| !a.card.capabilities.is_empty())
+            .map(|a| {
+                let npub = a.pubkey.to_bech32().unwrap_or_default();
+                let earned = earnings.get(&npub).copied().unwrap_or(0);
+                let (price, token) = a
+                    .card
+                    .metadata
+                    .as_ref()
+                    .map(|m| {
+                        let p = m["job_price"].as_u64().unwrap_or(0);
+                        let t = m["token"].as_str().unwrap_or("sol").to_string();
+                        (p, t)
+                    })
+                    .unwrap_or((0, "sol".into()));
+                let price_str = if price == 0 {
+                    "—".into()
+                } else if token == "usdc" {
+                    format!("{:.6} USDC", price as f64 / 1_000_000.0)
+                } else {
+                    format!("{:.4} SOL", price as f64 / 1_000_000_000.0)
+                };
+                AgentRow {
+                    name: a.card.name.clone(),
+                    npub: npub[..npub.len().min(20)].to_string(),
+                    capabilities: a.card.capabilities.join(", "),
+                    price: price_str,
+                    earned,
+                }
+            })
+            .collect();
+
+        // Sort by earned (descending)
+        rows.sort_by(|a, b| b.earned.cmp(&a.earned));
+
+        // 5. Format as text table
+        let mut output = String::new();
+        output.push_str(&format!(
+            "elisym Network Dashboard ({}/{})\n\
+             Agents: {}  |  Total Earned: {:.4} SOL  |  Job Results: {}\n\n",
+            filter_chain,
+            filter_network,
+            agents.len(),
+            total_earned_sol,
+            total_job_results,
+        ));
+
+        if rows.is_empty() {
+            output.push_str("No agents found on the network.\n");
+        } else {
+            // Header
+            output.push_str(&format!(
+                "{:<20} {:<20} {:<30} {:>12} {:>12}\n",
+                "Name", "Pubkey", "Capabilities", "Price", "Earned"
+            ));
+            output.push_str(&format!("{}\n", "─".repeat(96)));
+
+            // Rows (top N)
+            for row in rows.iter().take(top_n) {
+                let caps = truncate_str(&row.capabilities, 28);
+                let name = truncate_str(&row.name, 18);
+                let earned_str = if row.earned == 0 {
+                    "—".into()
+                } else {
+                    format!("{:.4} SOL", row.earned as f64 / 1_000_000_000.0)
+                };
+                output.push_str(&format!(
+                    "{:<20} {:<20} {:<30} {:>12} {:>12}\n",
+                    name, row.npub, caps, row.price, earned_str
+                ));
+            }
+
+            if rows.len() > top_n {
+                output.push_str(&format!(
+                    "\n… and {} more agent(s)\n",
+                    rows.len() - top_n
+                ));
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
     // ══════════════════════════════════════════════════════════════
     // Marketplace tools (customer)
     // ══════════════════════════════════════════════════════════════
@@ -128,7 +381,7 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<CreateJobInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let kind_offset = input.kind_offset.unwrap_or(100);
+        let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
         let input_type = input.input_type.as_deref().unwrap_or("text");
         let tags = input.tags.unwrap_or_default();
 
@@ -174,10 +427,11 @@ impl ElisymServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let timeout_secs = input.timeout_secs.unwrap_or(60);
 
+        let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
         let mut rx = match self
             .agent
             .marketplace
-            .subscribe_to_results(&[100], &[])
+            .subscribe_to_results(&[kind_offset], &[])
             .await
         {
             Ok(rx) => rx,
@@ -210,7 +464,7 @@ impl ElisymServer {
         {
             Ok(Some(result)) => {
                 let amount_info = result
-                    .amount_msat
+                    .amount
                     .map(|a| format!(" (amount: {a} lamports)"))
                     .unwrap_or_default();
                 Ok(CallToolResult::success(vec![Content::text(format!(
@@ -302,12 +556,36 @@ impl ElisymServer {
             }
         };
 
-        let kind_offset = input.kind_offset.unwrap_or(100);
+        let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
         let input_type = input.input_type.as_deref().unwrap_or("text");
         let tags = input.tags.unwrap_or_default();
         let total_timeout = input.timeout_secs.unwrap_or(300);
 
-        // 1. Submit the job
+        // 1. Subscribe to feedback and results BEFORE submitting (avoid race)
+        let mut feedback_rx = match self.agent.marketplace.subscribe_to_feedback().await {
+            Ok(rx) => rx,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to subscribe to feedback: {e}"
+                ))]))
+            }
+        };
+
+        let mut result_rx = match self
+            .agent
+            .marketplace
+            .subscribe_to_results(&[kind_offset], &[provider_pk])
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to subscribe to results: {e}"
+                ))]))
+            }
+        };
+
+        // 2. Submit the job
         let event_id = match self
             .agent
             .marketplace
@@ -332,30 +610,6 @@ impl ElisymServer {
 
         tracing::info!(event_id = %event_id, "Job submitted, waiting for feedback");
 
-        // 2. Subscribe to feedback and results
-        let mut feedback_rx = match self.agent.marketplace.subscribe_to_feedback().await {
-            Ok(rx) => rx,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Job submitted (ID: {event_id}) but failed to subscribe to feedback: {e}"
-                ))]))
-            }
-        };
-
-        let mut result_rx = match self
-            .agent
-            .marketplace
-            .subscribe_to_results(&[kind_offset], &[provider_pk])
-            .await
-        {
-            Ok(rx) => rx,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Job submitted (ID: {event_id}) but failed to subscribe to results: {e}"
-                ))]))
-            }
-        };
-
         let deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_secs(total_timeout);
         let mut status_log = vec![format!("Job submitted. Event ID: {event_id}")];
@@ -371,6 +625,13 @@ impl ElisymServer {
                     match fb.status.as_str() {
                         "payment-required" => {
                             if let Some(payment_request) = &fb.payment_request {
+                                // Validate fee before paying
+                                if let Some(err) = validate_payment_fee(payment_request) {
+                                    status_log.push(format!("Fee validation failed: {err}"));
+                                    return Ok(CallToolResult::error(vec![Content::text(
+                                        status_log.join("\n")
+                                    )]));
+                                }
                                 let provider = match self.agent.solana_payments() {
                                     Some(p) => p,
                                     None => {
@@ -420,7 +681,7 @@ impl ElisymServer {
                         continue;
                     }
                     let amount_info = result
-                        .amount_msat
+                        .amount
                         .map(|a| format!(" (amount: {a} lamports)"))
                         .unwrap_or_default();
                     status_log.push(format!("Result received{}:\n\n{}", amount_info, result.content));
@@ -611,7 +872,7 @@ impl ElisymServer {
     // Wallet tools
     // ══════════════════════════════════════════════════════════════
 
-    #[tool(description = "Get the Solana wallet balance for this agent. Returns the address and balance in SOL (or token balance if configured for SPL). Requires Solana payments to be configured via ELISYM_AGENT.")]
+    #[tool(description = "Get the Solana wallet balance for this agent. Returns the address and balance in SOL. Requires Solana payments to be configured via ELISYM_AGENT.")]
     fn get_balance(&self) -> String {
         let Some(provider) = self.agent.solana_payments() else {
             return "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.".to_string();
@@ -627,7 +888,7 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Pay a Solana payment request (from a provider's job feedback). Sends SOL or SPL tokens to fulfill the payment. Requires Solana payments to be configured via ELISYM_AGENT.")]
+    #[tool(description = "Pay a Solana payment request (from a provider's job feedback). Validates protocol fee before sending. Requires Solana payments to be configured via ELISYM_AGENT.")]
     fn send_payment(
         &self,
         Parameters(input): Parameters<SendPaymentInput>,
@@ -635,6 +896,11 @@ impl ElisymServer {
         let Some(provider) = self.agent.solana_payments() else {
             return "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.".to_string();
         };
+
+        // Validate fee params before paying — prevent provider from tampering
+        if let Some(err) = validate_payment_fee(&input.payment_request) {
+            return format!("Fee validation failed: {err}");
+        }
 
         match provider.pay(&input.payment_request) {
             Ok(result) => {
@@ -656,7 +922,7 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<PollNextJobInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let kind_offsets = input.kind_offsets.unwrap_or_else(|| vec![100]);
+        let kind_offsets = input.kind_offsets.unwrap_or_else(|| vec![DEFAULT_KIND_OFFSET]);
         let timeout_secs = input.timeout_secs.unwrap_or(60);
 
         let mut rx = match self
@@ -679,11 +945,22 @@ impl ElisymServer {
                 let event_id = job.event_id;
                 let customer_npub = job.customer.to_bech32().unwrap_or_default();
 
-                // Store the raw event for later use in feedback/result
-                self.job_events
-                    .lock()
-                    .await
-                    .insert(event_id, job.raw_event);
+                // Store the raw event for later use in feedback/result.
+                // Cap at 100 entries to prevent unbounded growth; evict oldest.
+                {
+                    let mut map = self.job_events.lock().await;
+                    if map.len() >= 100 {
+                        // Remove the entry with the lowest (oldest) created_at
+                        if let Some(oldest_id) = map
+                            .iter()
+                            .min_by_key(|(_, ev)| ev.created_at)
+                            .map(|(id, _)| *id)
+                        {
+                            map.remove(&oldest_id);
+                        }
+                    }
+                    map.insert(event_id, job.raw_event);
+                }
 
                 let info = serde_json::json!({
                     "event_id": event_id.to_string(),
@@ -691,7 +968,7 @@ impl ElisymServer {
                     "kind_offset": job.kind_offset,
                     "input_data": job.input_data,
                     "input_type": job.input_type,
-                    "bid_amount": job.bid_msat,
+                    "bid_amount": job.bid,
                     "tags": job.tags,
                 });
                 let json = serde_json::to_string_pretty(&info)
@@ -813,7 +1090,7 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Generate a Solana payment request to send to a customer (provider mode). Use the returned request string in send_job_feedback with status 'payment-required'.")]
+    #[tool(description = "Generate a Solana payment request with 3% protocol fee to send to a customer (provider mode). Use the returned request string in send_job_feedback with status 'payment-required'.")]
     fn create_payment_request(
         &self,
         Parameters(input): Parameters<CreatePaymentRequestInput>,
@@ -823,11 +1100,19 @@ impl ElisymServer {
         };
 
         let expiry = input.expiry_secs.unwrap_or(600);
-        match provider.create_payment_request(input.amount, &input.description, expiry) {
+        let fee_amount = (input.amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        match provider.create_payment_request_with_fee(
+            input.amount,
+            &input.description,
+            expiry,
+            PROTOCOL_TREASURY,
+            fee_amount,
+        ) {
             Ok(req) => {
+                let provider_net = input.amount - fee_amount;
                 format!(
-                    "Payment request created.\nRequest: {}\nAmount: {} lamports\nChain: {:?}",
-                    req.request, req.amount, req.chain
+                    "Payment request created.\nRequest: {}\nAmount: {} lamports (provider net: {}, fee: {})\nChain: {:?}",
+                    req.request, req.amount, provider_net, fee_amount, req.chain
                 )
             }
             Err(e) => format!("Error creating payment request: {e}"),
@@ -861,7 +1146,7 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<PublishCapabilitiesInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let supported_kinds = input.supported_kinds.unwrap_or_else(|| vec![100]);
+        let supported_kinds = input.supported_kinds.unwrap_or_else(|| vec![DEFAULT_KIND_OFFSET]);
 
         match self
             .agent

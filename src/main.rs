@@ -5,7 +5,7 @@ mod tools;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use elisym_core::{
-    AgentNodeBuilder, SolanaNetwork, SolanaPaymentConfig, SolanaPaymentProvider, SolanaToken,
+    AgentNodeBuilder, SolanaNetwork, SolanaPaymentConfig, SolanaPaymentProvider,
 };
 use rmcp::{ServiceExt, transport::stdio};
 use serde::Deserialize;
@@ -81,6 +81,7 @@ struct PaymentSection {
     #[serde(default)]
     rpc_url: Option<String>,
     #[serde(default = "default_token")]
+    #[allow(dead_code)]
     token: String,
     #[serde(default)]
     solana_secret_key: String,
@@ -97,6 +98,15 @@ fn default_token() -> String {
 }
 
 fn load_agent_config(name: &str) -> Result<AgentConfig> {
+    // Reject path traversal attempts (e.g. "../" or "/")
+    anyhow::ensure!(
+        !name.is_empty()
+            && !name.contains('/')
+            && !name.contains('\\')
+            && name != "."
+            && name != "..",
+        "Invalid agent name: '{name}'"
+    );
     let home = dirs::home_dir().context("Cannot find home directory")?;
     let path = home
         .join(".elisym")
@@ -122,15 +132,9 @@ fn build_solana_provider(payment: &PaymentSection) -> Option<SolanaPaymentProvid
         custom => SolanaNetwork::Custom(custom.to_string()),
     };
 
-    let token = match payment.token.as_str() {
-        "sol" => SolanaToken::Sol,
-        _ => SolanaToken::Sol,
-    };
-
     let config = SolanaPaymentConfig {
         network,
         rpc_url: payment.rpc_url.clone(),
-        token,
     };
 
     match SolanaPaymentProvider::from_secret_key(config, &payment.solana_secret_key) {
