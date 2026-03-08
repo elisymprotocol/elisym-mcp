@@ -13,7 +13,7 @@ use nostr_sdk::ToBech32;
 use solana_sdk::signature::Signer as _;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{self, EnvFilter};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use server::ElisymServer;
 
@@ -669,9 +669,10 @@ async fn main() -> Result<()> {
         let agent_desc = std::env::var("ELISYM_AGENT_DESCRIPTION")
             .unwrap_or_else(|_| "elisym MCP server agent".into());
 
+        let secret = Zeroizing::new(std::env::var("ELISYM_NOSTR_SECRET").unwrap());
         let mut b = AgentNodeBuilder::new(&agent_name, &agent_desc)
             .capabilities(vec!["mcp-gateway".into()])
-            .secret_key(std::env::var("ELISYM_NOSTR_SECRET").unwrap());
+            .secret_key(secret.as_str());
 
         if let Ok(relays) = std::env::var("ELISYM_RELAYS") {
             let relay_list: Vec<String> =

@@ -624,7 +624,7 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Wait for and retrieve the result of a previously submitted job request. Subscribes to NIP-90 results and waits up to the specified timeout. Note: only captures results arriving after this tool is called — if the provider already responded, the result may be missed. Use submit_and_pay_job for a race-free flow.")]
+    #[tool(description = "Retrieve the result of a previously submitted job request. First checks relays for an existing result, then subscribes to live results and waits up to the specified timeout.")]
     async fn get_job_result(
         &self,
         Parameters(input): Parameters<GetJobResultInput>,
@@ -635,6 +635,55 @@ impl ElisymServer {
         let timeout_secs = input.timeout_secs.unwrap_or(60).min(MAX_TIMEOUT_SECS);
 
         let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
+
+        let target_id = match EventId::parse(&input.job_event_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Invalid event ID: {e}"
+                ))]))
+            }
+        };
+
+        // 1. Historical fetch — check if the result already exists on relays
+        let result_kind = Kind::from(KIND_JOB_RESULT_BASE + kind_offset);
+        let historical_filter = nostr_sdk::Filter::new()
+            .kind(result_kind)
+            .event(target_id);
+        let fetch_timeout = tokio::time::Duration::from_secs(5);
+        if let Ok(events) = self
+            .agent
+            .client
+            .fetch_events(vec![historical_filter], Some(fetch_timeout))
+            .await
+        {
+            for event in events.iter() {
+                // Verify the #e tag matches our target job
+                let has_matching_e_tag = event.tags.iter().any(|tag| {
+                    let t = tag.as_slice();
+                    t.len() >= 2 && t[0] == "e" && t[1] == target_id.to_hex()
+                });
+                if has_matching_e_tag {
+                    let amount = event.tags.iter().find_map(|tag| {
+                        let t = tag.as_slice();
+                        if t.len() >= 2 && t[0] == "amount" {
+                            t[1].parse::<u64>().ok()
+                        } else {
+                            None
+                        }
+                    });
+                    let amount_info = amount
+                        .map(|a| format!(" (amount: {a} lamports)"))
+                        .unwrap_or_default();
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Job result received{}:\n\n{}",
+                        amount_info, event.content
+                    ))]));
+                }
+            }
+        }
+
+        // 2. Live subscription — wait for result in real time
         let mut rx = match self
             .agent
             .marketplace
@@ -645,15 +694,6 @@ impl ElisymServer {
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "Error subscribing to results: {e}"
-                ))]))
-            }
-        };
-
-        let target_id = match EventId::parse(&input.job_event_id) {
-            Ok(id) => id,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Invalid event ID: {e}"
                 ))]))
             }
         };
