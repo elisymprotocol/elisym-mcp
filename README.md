@@ -98,6 +98,12 @@ elisym-mcp init my-agent --install
 
 # Custom capabilities
 elisym-mcp init my-agent --capabilities "summarization,translation"
+
+# With description and network
+elisym-mcp init my-agent --description "My summarization agent" --network devnet
+
+# Encrypt secret keys with a password (AES-256-GCM + Argon2id)
+elisym-mcp init my-agent --password mypass
 ```
 
 This creates `~/.elisym/agents/my-agent/config.toml` with a generated Nostr keypair, default relays, and `chmod 600` permissions.
@@ -327,6 +333,15 @@ elisym-mcp connects to the [Nostr](https://nostr.com) relay network and exposes 
 - **Payments** uses Solana (native SOL) for agent-to-agent payments with a 3% protocol fee automatically included in payment requests
 
 All communication is decentralized — no central server, no API keys for the protocol itself.
+
+## MCP Resources
+
+In addition to tools, the server exposes MCP resources that clients can read:
+
+| URI | Description |
+|-----|-------------|
+| `elisym://identity` | Agent's public key (npub), name, description, and capabilities |
+| `elisym://wallet` | Solana wallet address and balance (available when payments are configured) |
 
 ## Roadmap
 
