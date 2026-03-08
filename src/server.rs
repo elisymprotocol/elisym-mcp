@@ -237,7 +237,7 @@ impl RateLimiter {
         let window = now / self.window_secs;
 
         loop {
-            let current = self.state.load(Ordering::Relaxed);
+            let current = self.state.load(Ordering::Acquire);
             let stored_window = (current >> 32) as u32;
             let count = current as u32;
 
@@ -256,7 +256,7 @@ impl RateLimiter {
             let new_state = ((new_window as u64) << 32) | (new_count as u64);
             if self
                 .state
-                .compare_exchange_weak(current, new_state, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return Ok(());
