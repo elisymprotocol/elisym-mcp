@@ -127,7 +127,11 @@ fn validate_payment_fee(request: &str) -> Option<String> {
         Err(e) => return Some(format!("Invalid payment request JSON: {e}")),
     };
 
-    let expected_fee = (data.amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+    let expected_fee = data
+        .amount
+        .checked_mul(PROTOCOL_FEE_BPS)
+        .map(|v| v.div_ceil(10_000))
+        .unwrap_or(u64::MAX);
 
     match (data.fee_address.as_deref(), data.fee_amount) {
         (Some(addr), Some(amt)) if amt > 0 => {
@@ -167,9 +171,15 @@ fn truncate_str(s: &str, max: usize) -> Cow<'_, str> {
     }
 }
 
-/// Format lamports as SOL with 9 decimal places (integer math, no f64).
+/// Format lamports as a numeric SOL string with 9 decimal places (integer math, no f64).
+/// Returns just the number (e.g. "1.500000000"), suitable for JSON fields.
+fn format_sol_numeric(lamports: u64) -> String {
+    format!("{}.{:09}", lamports / 1_000_000_000, lamports % 1_000_000_000)
+}
+
+/// Format lamports as SOL with 9 decimal places and " SOL" suffix (integer math, no f64).
 fn format_sol(lamports: u64) -> String {
-    format!("{}.{:09} SOL", lamports / 1_000_000_000, lamports % 1_000_000_000)
+    format!("{} SOL", format_sol_numeric(lamports))
 }
 
 /// Format lamports as SOL with 4 decimal places (integer math, no f64).
@@ -244,6 +254,8 @@ impl RateLimiter {
 }
 
 /// Rate limiter for payment and messaging tools (10 calls per 10s window).
+/// Global (shared across all HTTP sessions) — limits aggregate throughput,
+/// not per-client. For stdio transport this is a single-client process.
 static TOOL_RATE_LIMITER: RateLimiter = RateLimiter::new(10, 10);
 
 pub struct ElisymServer {
@@ -285,6 +297,12 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<SearchAgentsInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if input.capabilities.len() > MAX_CAPABILITIES {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Too many capabilities: {} (max {MAX_CAPABILITIES})",
+                input.capabilities.len()
+            ))]));
+        }
         let filter = AgentFilter {
             capabilities: input.capabilities,
             job_kind: input.job_kind,
@@ -1062,7 +1080,10 @@ impl ElisymServer {
 
         loop {
             tokio::select! {
-                Some(msg) = rx.recv() => {
+                msg_opt = rx.recv() => {
+                    let Some(msg) = msg_opt else {
+                        break; // channel closed
+                    };
                     let sender_npub = msg.sender.to_bech32().unwrap_or_default();
                     messages.push(serde_json::json!({
                         "sender_npub": sender_npub,
@@ -1360,8 +1381,13 @@ impl ElisymServer {
         };
 
         let expiry = input.expiry_secs.unwrap_or(600);
-        // Fee rounds up to nearest lamport (div_ceil favors protocol)
-        let fee_amount = (input.amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        // Fee rounds up to nearest lamport (div_ceil favors protocol).
+        // checked_mul guards against overflow on very large amounts.
+        let fee_amount = input
+            .amount
+            .checked_mul(PROTOCOL_FEE_BPS)
+            .map(|v| v.div_ceil(10_000))
+            .unwrap_or(u64::MAX);
         match tokio::task::block_in_place(|| provider.create_payment_request_with_fee(
             input.amount,
             &input.description,
@@ -1548,7 +1574,7 @@ impl ServerHandler for ElisymServer {
                 let wallet = serde_json::json!({
                     "address": address,
                     "balance_lamports": balance,
-                    "balance_sol": format_sol(balance),
+                    "balance_sol": format_sol_numeric(balance),
                     "chain": "solana",
                 });
                 let json = serde_json::to_string_pretty(&wallet).unwrap_or_default();
@@ -1772,6 +1798,25 @@ mod tests {
     fn fee_calculation_zero() {
         let fee = (0u64 * PROTOCOL_FEE_BPS).div_ceil(10_000);
         assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn fee_calculation_overflow_safe() {
+        // Very large amount that would overflow with unchecked mul
+        let large = u64::MAX / 100;
+        let fee = large
+            .checked_mul(PROTOCOL_FEE_BPS)
+            .map(|v| v.div_ceil(10_000))
+            .unwrap_or(u64::MAX);
+        assert_eq!(fee, u64::MAX);
+    }
+
+    // ── format_sol_numeric ──────────────────────────────────────────
+
+    #[test]
+    fn format_sol_numeric_value() {
+        assert_eq!(format_sol_numeric(1_500_000_000), "1.500000000");
+        assert_eq!(format_sol_numeric(0), "0.000000000");
     }
 
     // ── RateLimiter ─────────────────────────────────────────────────

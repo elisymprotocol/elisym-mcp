@@ -376,6 +376,16 @@ fn run_init(
     let config_content = toml::to_string_pretty(&init_config)
         .context("Failed to serialize config")?;
 
+    // Zeroize secret key material now that it's been serialized.
+    // SecretsBundle (encrypted path) handles ZeroizeOnDrop; for the plaintext
+    // path, zeroize the fields that held raw secret keys.
+    if let Some(mut sk) = init_config.secret_key {
+        sk.zeroize();
+    }
+    if let Some(mut sk) = init_config.payment.solana_secret_key {
+        sk.zeroize();
+    }
+
     // Create directory and write config
     std::fs::create_dir_all(&agent_dir)
         .with_context(|| format!("Cannot create {}", agent_dir.display()))?;
