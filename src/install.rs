@@ -28,7 +28,9 @@ fn home() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// Check if an MCP client app is installed on this machine (macOS only).
+/// Check if an MCP client app is installed on this machine.
+/// Currently only implemented for macOS (/Applications/*.app check).
+/// On other platforms, auto-detection relies solely on config file existence.
 fn is_app_installed(client_name: &str) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
@@ -178,8 +180,11 @@ fn install_to_config(path: &PathBuf, agent: Option<&str>, env: &[(String, String
             .with_context(|| format!("Cannot create directory {}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(&config)?;
-    std::fs::write(path, json + "\n")
-        .with_context(|| format!("Cannot write {}", path.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json + "\n")
+        .with_context(|| format!("Cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("Cannot rename {} to {}", tmp.display(), path.display()))?;
 
     Ok(true)
 }
@@ -318,7 +323,9 @@ pub fn run_uninstall(client_filter: Option<&str>) -> Result<()> {
         if let Some(servers) = config.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
             if servers.remove("elisym").is_some() {
                 let json = serde_json::to_string_pretty(&config)?;
-                std::fs::write(&path, json + "\n")?;
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, json + "\n")?;
+                std::fs::rename(&tmp, &path)?;
                 println!("  Removed from {} ({})", client.name, path.display());
                 removed += 1;
             }

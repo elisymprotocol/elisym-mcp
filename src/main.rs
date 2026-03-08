@@ -312,14 +312,6 @@ fn run_init(
     let agent_dir = home.join(".elisym").join("agents").join(name);
     let config_path = agent_dir.join("config.toml");
 
-    if config_path.exists() {
-        anyhow::bail!(
-            "Agent '{}' already exists at {}",
-            name,
-            config_path.display()
-        );
-    }
-
     // Generate Nostr keypair
     let keys = nostr_sdk::Keys::generate();
     let secret_hex = keys.secret_key().to_secret_hex();
@@ -408,6 +400,7 @@ fn run_init(
         .context("Failed to serialize config")?;
 
     // Zeroize secret key material now that it's been serialized.
+    // Note: serde/toml internal buffers are not zeroizable — this is a known limitation.
     // SecretsBundle (encrypted path) handles ZeroizeOnDrop; for the plaintext
     // path, zeroize the fields that held raw secret keys.
     if let Some(mut sk) = init_config.secret_key {
@@ -417,11 +410,19 @@ fn run_init(
         sk.zeroize();
     }
 
-    // Create directory and write config
+    // Create directory and write config atomically (create_new prevents TOCTOU race)
     std::fs::create_dir_all(&agent_dir)
         .with_context(|| format!("Cannot create {}", agent_dir.display()))?;
-    std::fs::write(&config_path, &config_content)
-        .with_context(|| format!("Cannot write {}", config_path.display()))?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&config_path)
+            .with_context(|| format!("Agent '{}' already exists at {}", name, config_path.display()))?;
+        file.write_all(config_content.as_bytes())
+            .with_context(|| format!("Cannot write {}", config_path.display()))?;
+    }
     config_content.zeroize();
 
     // Set permissions to 600 (owner-only) on Unix
@@ -516,8 +517,12 @@ async fn start_http_server(
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or_default();
-                    // Constant-time comparison to prevent timing side-channels
-                    if auth.as_bytes().ct_eq(expected.as_bytes()).into() {
+                    // Constant-time comparison to prevent timing side-channels.
+                    // Explicit length check avoids relying on ct_eq's implicit
+                    // early-return for different-length slices.
+                    if auth.len() == expected.len()
+                        && auth.as_bytes().ct_eq(expected.as_bytes()).into()
+                    {
                         Ok(next.run(req).await)
                     } else {
                         Err(StatusCode::UNAUTHORIZED)
@@ -530,6 +535,14 @@ async fn start_http_server(
         tracing::warn!(
             "HTTP transport exposed on {host} without authentication. \
              Consider using --http-token for security."
+        );
+    }
+
+    // Deny browser cross-origin requests when exposed on non-localhost
+    if host != "127.0.0.1" && host != "localhost" {
+        router = router.layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::AllowOrigin::list([])),
         );
     }
 
@@ -570,6 +583,9 @@ async fn main() -> Result<()> {
                 let mut env = Vec::new();
                 if let Some(ref pw) = password {
                     eprintln!("WARNING: --password is visible in process listings. Use ELISYM_AGENT_PASSWORD env var instead.");
+                    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                        eprintln!("HINT: Running non-interactively. Prefer ELISYM_AGENT_PASSWORD env var over --password.");
+                    }
                     env.push(("ELISYM_AGENT_PASSWORD".to_string(), pw.clone()));
                 }
                 if let Some(ref tok) = install_http_token {
@@ -604,6 +620,9 @@ async fn main() -> Result<()> {
         }) => {
             if password.is_some() {
                 eprintln!("WARNING: --password is visible in process listings. Use ELISYM_AGENT_PASSWORD env var instead.");
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    eprintln!("HINT: Running non-interactively. Prefer ELISYM_AGENT_PASSWORD env var over --password.");
+                }
             }
             let net = network.as_deref().unwrap_or("devnet");
             run_init(

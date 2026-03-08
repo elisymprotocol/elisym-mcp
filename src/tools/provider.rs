@@ -21,7 +21,7 @@ pub struct SendJobFeedbackInput {
     pub job_event_id: String,
 
     /// Status: "payment-required", "processing", "error", "success", "partial".
-    #[schemars(description = "Feedback status: 'payment-required', 'processing', 'error', 'success', 'partial'")]
+    #[schemars(description = "Feedback status: payment-required, processing, error, success, or partial")]
     pub status: String,
 
     /// Optional extra info (e.g. error message).

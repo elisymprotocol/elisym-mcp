@@ -43,6 +43,11 @@ const MAX_PAYMENT_REQ_LEN: usize = 10_000;
 const MAX_DESCRIPTION_LEN: usize = 1_000;
 const MAX_CAPABILITIES: usize = 50;
 
+/// Maximum allowed timeout for any user-supplied timeout_secs parameter (10 minutes).
+const MAX_TIMEOUT_SECS: u64 = 600;
+/// Maximum allowed value for max_messages parameter.
+const MAX_MESSAGES: usize = 1000;
+
 /// Validate that a string field does not exceed `max` bytes.
 fn check_len(field: &str, value: &str, max: usize) -> Result<(), String> {
     if value.len() > max {
@@ -183,6 +188,7 @@ fn format_sol(lamports: u64) -> String {
 }
 
 /// Format lamports as SOL with 4 decimal places (integer math, no f64).
+/// Note: the sub-SOL part is truncated (not rounded) to 4 decimal places.
 fn format_sol_short(lamports: u64) -> String {
     format!(
         "{}.{:04} SOL",
@@ -192,6 +198,10 @@ fn format_sol_short(lamports: u64) -> String {
 }
 
 /// Heartbeat message for ping/pong liveness checks (NIP-17 encrypted).
+///
+/// Wire format: JSON `{"type": "elisym_ping"|"elisym_pong", "nonce": "<hex>"}` sent as
+/// a NIP-17 gift-wrapped encrypted message. The pinger generates a random nonce and sends
+/// `elisym_ping`; the responder replies with `elisym_pong` and the same nonce.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HeartbeatMessage {
     #[serde(rename = "type")]
@@ -202,7 +212,8 @@ struct HeartbeatMessage {
 /// Simple sliding-window rate limiter using atomics.
 /// Allows `max_calls` per `window_secs` second window.
 struct RateLimiter {
-    /// Packed: upper 32 bits = window start (unix secs truncated), lower 32 bits = count.
+    /// Packed: upper 32 bits = window start (unix secs truncated to u32), lower 32 bits = count.
+    /// The u32 unix timestamp will overflow in 2106 — acceptable for a rate limiter.
     state: AtomicU64,
     max_calls: u32,
     window_secs: u32,
@@ -254,9 +265,10 @@ impl RateLimiter {
     }
 }
 
-/// Rate limiter for payment and messaging tools (10 calls per 10s window).
-/// Global (shared across all HTTP sessions) — limits aggregate throughput,
-/// not per-client. For stdio transport this is a single-client process.
+/// Global rate limiter shared across all payment/messaging tools:
+/// send_payment, send_message, create_payment_request, submit_and_pay_job.
+/// Limits aggregate throughput to 10 calls per 10s window.
+/// Shared across all HTTP sessions; for stdio transport this is a single-client process.
 static TOOL_RATE_LIMITER: RateLimiter = RateLimiter::new(10, 10);
 
 pub struct ElisymServer {
@@ -373,14 +385,15 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<GetDashboardInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let top_n = input.top_n.unwrap_or(10);
-        let timeout_secs = input.timeout_secs.unwrap_or(15);
+        let top_n = input.top_n.unwrap_or(10).min(100);
+        let timeout_secs = input.timeout_secs.unwrap_or(15).min(MAX_TIMEOUT_SECS);
         let filter_chain = input.chain.unwrap_or_else(|| "solana".into());
         let filter_network = input.network.unwrap_or_else(|| "devnet".into());
         let fetch_timeout = Some(std::time::Duration::from_secs(timeout_secs));
 
         // 1. Discover all agents and filter by chain + network locally.
         //    Protocol-level filtering by chain/network is not yet supported in elisym-core.
+        // TODO(elisym-core): Add chain/network filter to AgentFilter to avoid fetching all agents.
         let filter = elisym_core::AgentFilter::default();
         let all_agents = match self.agent.discovery.search_agents(&filter).await {
             Ok(a) => a,
@@ -456,12 +469,13 @@ impl ElisymServer {
                 }
             });
             if let Some(amt) = amount {
-                *earnings.entry(npub).or_insert(0) += amt;
+                let entry = earnings.entry(npub).or_insert(0);
+                *entry = entry.saturating_add(amt);
             }
         }
 
         // Total earned across ALL agents in this network
-        let total_earned_lamports: u64 = earnings.values().sum();
+        let total_earned_lamports: u64 = earnings.values().copied().fold(0u64, u64::saturating_add);
 
         // 4. Build agent list with earnings, filter out observers
         struct AgentRow {
@@ -618,7 +632,7 @@ impl ElisymServer {
         if let Err(err) = check_len("job_event_id", &input.job_event_id, MAX_EVENT_ID_LEN) {
             return Ok(CallToolResult::error(vec![Content::text(err)]));
         }
-        let timeout_secs = input.timeout_secs.unwrap_or(60);
+        let timeout_secs = input.timeout_secs.unwrap_or(60).min(MAX_TIMEOUT_SECS);
 
         let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
         let mut rx = match self
@@ -683,7 +697,7 @@ impl ElisymServer {
         if let Err(err) = check_len("job_event_id", &input.job_event_id, MAX_EVENT_ID_LEN) {
             return Ok(CallToolResult::error(vec![Content::text(err)]));
         }
-        let timeout_secs = input.timeout_secs.unwrap_or(60);
+        let timeout_secs = input.timeout_secs.unwrap_or(60).min(MAX_TIMEOUT_SECS);
 
         let mut rx = match self.agent.marketplace.subscribe_to_feedback().await {
             Ok(rx) => rx,
@@ -764,7 +778,7 @@ impl ElisymServer {
         let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
         let input_type = input.input_type.as_deref().unwrap_or("text");
         let tags = input.tags.unwrap_or_default();
-        let total_timeout = input.timeout_secs.unwrap_or(300);
+        let total_timeout = input.timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS);
 
         // 1. Subscribe to feedback and results BEFORE submitting (avoid race)
         let mut feedback_rx = match self.agent.marketplace.subscribe_to_feedback().await {
@@ -861,17 +875,18 @@ impl ElisymServer {
                                         status_log.join("\n")
                                     )]));
                                 }
-                                let provider = match self.agent.solana_payments() {
-                                    Some(p) => p,
-                                    None => {
-                                        status_log.push("Payment required but Solana payments not configured.".into());
-                                        return Ok(CallToolResult::error(vec![Content::text(
-                                            status_log.join("\n")
-                                        )]));
-                                    }
-                                };
-                                match tokio::task::block_in_place(|| provider.pay(payment_request)) {
-                                    Ok(result) => {
+                                if self.agent.solana_payments().is_none() {
+                                    status_log.push("Payment required but Solana payments not configured.".into());
+                                    return Ok(CallToolResult::error(vec![Content::text(
+                                        status_log.join("\n")
+                                    )]));
+                                }
+                                let agent = Arc::clone(&self.agent);
+                                let pr = payment_request.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    agent.solana_payments().unwrap().pay(&pr)
+                                }).await {
+                                    Ok(Ok(result)) => {
                                         status_log.push(format!(
                                             "Payment sent: {} ({})",
                                             result.payment_id, result.status
@@ -879,8 +894,14 @@ impl ElisymServer {
                                         paid = true;
                                         tracing::info!("Payment sent, waiting for result");
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         status_log.push(format!("Payment failed: {e}"));
+                                        return Ok(CallToolResult::error(vec![Content::text(
+                                            status_log.join("\n")
+                                        )]));
+                                    }
+                                    Err(e) => {
+                                        status_log.push(format!("Payment task panicked: {e}"));
                                         return Ok(CallToolResult::error(vec![Content::text(
                                             status_log.join("\n")
                                         )]));
@@ -950,7 +971,7 @@ impl ElisymServer {
             }
         };
 
-        let timeout_secs = input.timeout_secs.unwrap_or(15);
+        let timeout_secs = input.timeout_secs.unwrap_or(15).min(MAX_TIMEOUT_SECS);
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nonce = format!(
             "{:x}{:x}",
@@ -1063,8 +1084,8 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<ReceiveMessagesInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let timeout_secs = input.timeout_secs.unwrap_or(30);
-        let max_messages = input.max_messages.unwrap_or(10);
+        let timeout_secs = input.timeout_secs.unwrap_or(30).min(MAX_TIMEOUT_SECS);
+        let max_messages = input.max_messages.unwrap_or(10).min(MAX_MESSAGES);
 
         let mut rx = match self.agent.messaging.subscribe_to_messages().await {
             Ok(rx) => rx,
@@ -1128,15 +1149,21 @@ impl ElisymServer {
         };
 
         let address = provider.address();
-        match tokio::task::block_in_place(|| provider.balance()) {
-            Ok(lamports) => {
+        let agent = Arc::clone(&self.agent);
+        match tokio::task::spawn_blocking(move || {
+            agent.solana_payments().unwrap().balance()
+        }).await {
+            Ok(Ok(lamports)) => {
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Address: {address}\nBalance: {} ({lamports} lamports)",
                     format_sol(lamports)
                 ))]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Address: {address}\nError fetching balance: {e}"
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Address: {address}\nBalance check panicked: {e}"
             ))])),
         }
     }
@@ -1153,11 +1180,11 @@ impl ElisymServer {
             return Ok(CallToolResult::error(vec![Content::text(err)]));
         }
 
-        let Some(provider) = self.agent.solana_payments() else {
+        if self.agent.solana_payments().is_none() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
             )]));
-        };
+        }
 
         // Validate fee params before paying — prevent provider from tampering
         if let Some(err) = validate_payment_fee(&input.payment_request) {
@@ -1166,13 +1193,20 @@ impl ElisymServer {
             ))]));
         }
 
-        match tokio::task::block_in_place(|| provider.pay(&input.payment_request)) {
-            Ok(result) => Ok(CallToolResult::success(vec![Content::text(format!(
+        let agent = Arc::clone(&self.agent);
+        let payment_request = input.payment_request;
+        match tokio::task::spawn_blocking(move || {
+            agent.solana_payments().unwrap().pay(&payment_request)
+        }).await {
+            Ok(Ok(result)) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Payment sent successfully.\nTransaction: {}\nStatus: {}",
                 result.payment_id, result.status
             ))])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Payment failed: {e}"
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Payment task panicked: {e}"
             ))])),
         }
     }
@@ -1187,7 +1221,7 @@ impl ElisymServer {
         Parameters(input): Parameters<PollNextJobInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let kind_offsets = input.kind_offsets.unwrap_or_else(|| vec![DEFAULT_KIND_OFFSET]);
-        let timeout_secs = input.timeout_secs.unwrap_or(60);
+        let timeout_secs = input.timeout_secs.unwrap_or(60).min(MAX_TIMEOUT_SECS);
 
         let mut rx = match self
             .agent
@@ -1247,6 +1281,11 @@ impl ElisymServer {
         }
         if let Some(ref pr) = input.payment_request {
             if let Err(err) = check_len("payment_request", pr, MAX_PAYMENT_REQ_LEN) {
+                return Ok(CallToolResult::error(vec![Content::text(err)]));
+            }
+        }
+        if let Some(ref info) = input.extra_info {
+            if let Err(err) = check_len("extra_info", info, MAX_DESCRIPTION_LEN) {
                 return Ok(CallToolResult::error(vec![Content::text(err)]));
             }
         }
@@ -1375,11 +1414,11 @@ impl ElisymServer {
             )]));
         }
 
-        let Some(provider) = self.agent.solana_payments() else {
+        if self.agent.solana_payments().is_none() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
             )]));
-        };
+        }
 
         let expiry = input.expiry_secs.unwrap_or(600);
         // Fee rounds up to nearest lamport (div_ceil favors protocol).
@@ -1389,15 +1428,20 @@ impl ElisymServer {
             .checked_mul(PROTOCOL_FEE_BPS)
             .map(|v| v.div_ceil(10_000))
             .unwrap_or(u64::MAX);
-        match tokio::task::block_in_place(|| provider.create_payment_request_with_fee(
-            input.amount,
-            &input.description,
-            expiry,
-            PROTOCOL_TREASURY,
-            fee_amount,
-        )) {
-            Ok(req) => {
-                let provider_net = input.amount.saturating_sub(fee_amount);
+        let agent = Arc::clone(&self.agent);
+        let amount = input.amount;
+        let description = input.description;
+        match tokio::task::spawn_blocking(move || {
+            agent.solana_payments().unwrap().create_payment_request_with_fee(
+                amount,
+                &description,
+                expiry,
+                PROTOCOL_TREASURY,
+                fee_amount,
+            )
+        }).await {
+            Ok(Ok(req)) => {
+                let provider_net = amount.saturating_sub(fee_amount);
                 let result = serde_json::json!({
                     "payment_request": req.request,
                     "amount_lamports": req.amount,
@@ -1408,8 +1452,11 @@ impl ElisymServer {
                 let json = serde_json::to_string_pretty(&result).unwrap_or_default();
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error creating payment request: {e}"
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Payment request task panicked: {e}"
             ))])),
         }
     }
@@ -1423,14 +1470,18 @@ impl ElisymServer {
             return Ok(CallToolResult::error(vec![Content::text(err)]));
         }
 
-        let Some(provider) = self.agent.solana_payments() else {
+        if self.agent.solana_payments().is_none() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
             )]));
-        };
+        }
 
-        match tokio::task::block_in_place(|| provider.lookup_payment(&input.payment_request)) {
-            Ok(status) => {
+        let agent = Arc::clone(&self.agent);
+        let payment_request = input.payment_request;
+        match tokio::task::spawn_blocking(move || {
+            agent.solana_payments().unwrap().lookup_payment(&payment_request)
+        }).await {
+            Ok(Ok(status)) => {
                 let settled = if status.settled { "Yes" } else { "No" };
                 let amount_info = status
                     .amount
@@ -1440,8 +1491,11 @@ impl ElisymServer {
                     "Settled: {settled}{amount_info}"
                 ))]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error checking payment: {e}"
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Payment status check panicked: {e}"
             ))])),
         }
     }
@@ -1569,8 +1623,10 @@ impl ServerHandler for ElisymServer {
                 };
 
                 let address = provider.address();
-                let balance =
-                    tokio::task::block_in_place(|| provider.balance()).unwrap_or(0);
+                let agent = Arc::clone(&self.agent);
+                let balance = tokio::task::spawn_blocking(move || {
+                    agent.solana_payments().unwrap().balance()
+                }).await.unwrap_or(Ok(0)).unwrap_or(0);
 
                 let wallet = serde_json::json!({
                     "address": address,
@@ -1598,9 +1654,9 @@ mod tests {
 
     // ── JobEventsCache ──────────────────────────────────────────────
 
-    fn dummy_event(id_byte: u8) -> (EventId, Event) {
+    fn dummy_event(label: u8) -> (EventId, Event) {
         let keys = nostr_sdk::Keys::generate();
-        let builder = nostr_sdk::EventBuilder::text_note(format!("test-{id_byte}"));
+        let builder = nostr_sdk::EventBuilder::text_note(format!("test-{label}"));
         let event = builder.sign_with_keys(&keys).unwrap();
         (event.id, event)
     }
