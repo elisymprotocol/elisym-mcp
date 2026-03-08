@@ -210,6 +210,7 @@ struct RateLimiter {
 
 impl RateLimiter {
     const fn new(max_calls: u32, window_secs: u32) -> Self {
+        assert!(window_secs > 0, "window_secs must be > 0");
         Self {
             state: AtomicU64::new(0),
             max_calls,

@@ -122,6 +122,25 @@ struct AgentConfig {
     encryption: Option<crypto::EncryptionSection>,
 }
 
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("name", &self.name)
+            .field("secret_key", &"[REDACTED]")
+            .field("encryption", &self.encryption.is_some())
+            .finish()
+    }
+}
+
+impl Drop for AgentConfig {
+    fn drop(&mut self) {
+        self.secret_key.zeroize();
+        if let Some(ref mut p) = self.payment {
+            p.solana_secret_key.zeroize();
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct PaymentSection {
     #[serde(default = "default_chain")]
@@ -138,6 +157,16 @@ struct PaymentSection {
     #[serde(default = "default_payment_timeout")]
     #[allow(dead_code)]
     payment_timeout_secs: u32,
+}
+
+impl std::fmt::Debug for PaymentSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaymentSection")
+            .field("chain", &self.chain)
+            .field("network", &self.network)
+            .field("solana_secret_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 fn default_chain() -> String {
@@ -193,10 +222,12 @@ fn load_agent_config(name: &str) -> Result<AgentConfig> {
         }
     }
 
-    let contents = std::fs::read_to_string(&path)
+    let mut contents = std::fs::read_to_string(&path)
         .with_context(|| format!("Agent '{}' not found at {}", name, path.display()))?;
+    let config_result: Result<AgentConfig, _> = toml::from_str(&contents);
+    contents.zeroize();
     let mut config: AgentConfig =
-        toml::from_str(&contents).with_context(|| format!("Invalid config for agent '{}'", name))?;
+        config_result.with_context(|| format!("Invalid config for agent '{}'", name))?;
 
     // Decrypt secrets if the config is encrypted
     if let Some(ref enc) = config.encryption {
@@ -373,7 +404,7 @@ fn run_init(
         encryption: encryption_field,
     };
 
-    let config_content = toml::to_string_pretty(&init_config)
+    let mut config_content = toml::to_string_pretty(&init_config)
         .context("Failed to serialize config")?;
 
     // Zeroize secret key material now that it's been serialized.
@@ -391,6 +422,7 @@ fn run_init(
         .with_context(|| format!("Cannot create {}", agent_dir.display()))?;
     std::fs::write(&config_path, &config_content)
         .with_context(|| format!("Cannot write {}", config_path.display()))?;
+    config_content.zeroize();
 
     // Set permissions to 600 (owner-only) on Unix
     #[cfg(unix)]
