@@ -13,6 +13,7 @@ use nostr_sdk::ToBech32;
 use solana_sdk::signature::Signer as _;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{self, EnvFilter};
+use zeroize::Zeroize;
 
 use server::ElisymServer;
 
@@ -152,17 +153,21 @@ fn default_payment_timeout() -> u32 {
     120
 }
 
-fn load_agent_config(name: &str) -> Result<AgentConfig> {
-    // Reject path traversal attempts (e.g. "../" or "/") and hidden dirs (e.g. ".hidden")
+/// Validate agent name: only ASCII alphanumeric, hyphens, underscores. Max 64 chars.
+fn validate_agent_name(name: &str) -> Result<()> {
     anyhow::ensure!(
         !name.is_empty()
-            && !name.contains('/')
-            && !name.contains('\\')
-            && !name.starts_with('.')
-            && name != "."
-            && name != "..",
-        "Invalid agent name: '{name}'"
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        "Invalid agent name: '{name}'. Only [a-zA-Z0-9_-] allowed, max 64 chars."
     );
+    Ok(())
+}
+
+fn load_agent_config(name: &str) -> Result<AgentConfig> {
+    validate_agent_name(name)?;
     let home = dirs::home_dir().context("Cannot find home directory")?;
     let path = home
         .join(".elisym")
@@ -195,13 +200,15 @@ fn load_agent_config(name: &str) -> Result<AgentConfig> {
 
     // Decrypt secrets if the config is encrypted
     if let Some(ref enc) = config.encryption {
-        let password = std::env::var("ELISYM_AGENT_PASSWORD").with_context(|| {
+        let mut password = std::env::var("ELISYM_AGENT_PASSWORD").with_context(|| {
             format!(
                 "Agent '{}' has encrypted secrets. Set ELISYM_AGENT_PASSWORD env var to decrypt.",
                 name
             )
         })?;
-        let bundle = crypto::decrypt_secrets(enc, &password)
+        let result = crypto::decrypt_secrets(enc, &password);
+        password.zeroize();
+        let bundle = result
             .with_context(|| format!("Failed to decrypt secrets for agent '{}'", name))?;
         config.secret_key = bundle.nostr_secret_key.clone();
         if let Some(ref mut payment) = config.payment {
@@ -268,16 +275,7 @@ fn run_init(
     network: &str,
     quiet: bool,
 ) -> Result<()> {
-    // Validate agent name (same rules as load_agent_config)
-    anyhow::ensure!(
-        !name.is_empty()
-            && !name.contains('/')
-            && !name.contains('\\')
-            && !name.starts_with('.')
-            && name != "."
-            && name != "..",
-        "Invalid agent name: '{name}'"
-    );
+    validate_agent_name(name)?;
 
     let home = dirs::home_dir().context("Cannot find home directory")?;
     let agent_dir = home.join(".elisym").join("agents").join(name);
@@ -429,7 +427,6 @@ async fn start_http_server(
     port: u16,
     http_token: Option<String>,
 ) -> Result<()> {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use rmcp::transport::streamable_http_server::{
@@ -438,7 +435,7 @@ async fn start_http_server(
     };
 
     let agent = Arc::new(agent);
-    let job_events = Arc::new(Mutex::new(HashMap::new()));
+    let job_cache = Arc::new(Mutex::new(server::JobEventsCache::new()));
 
     let ct = tokio_util::sync::CancellationToken::new();
     let config = StreamableHttpServerConfig {
@@ -448,13 +445,13 @@ async fn start_http_server(
     };
 
     let agent_clone = Arc::clone(&agent);
-    let job_events_clone = Arc::clone(&job_events);
+    let job_cache_clone = Arc::clone(&job_cache);
 
     let service: StreamableHttpService<ElisymServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(ElisymServer::from_shared(
                 Arc::clone(&agent_clone),
-                Arc::clone(&job_events_clone),
+                Arc::clone(&job_cache_clone),
             )),
             Default::default(),
             config,
@@ -520,7 +517,7 @@ async fn main() -> Result<()> {
         Some(Commands::Install {
             client,
             agent,
-            password,
+            mut password,
             http_token: install_http_token,
             extra_env,
             list,
@@ -530,9 +527,11 @@ async fn main() -> Result<()> {
             } else {
                 let mut env = Vec::new();
                 if let Some(ref pw) = password {
+                    eprintln!("WARNING: --password is visible in process listings. Use ELISYM_AGENT_PASSWORD env var instead.");
                     env.push(("ELISYM_AGENT_PASSWORD".to_string(), pw.clone()));
                 }
                 if let Some(ref tok) = install_http_token {
+                    eprintln!("WARNING: --http-token is visible in process listings. Use ELISYM_HTTP_TOKEN env var instead.");
                     env.push(("ELISYM_HTTP_TOKEN".to_string(), tok.clone()));
                 }
                 for kv in &extra_env {
@@ -544,6 +543,9 @@ async fn main() -> Result<()> {
                 }
                 install::run_install(client.as_deref(), agent.as_deref(), &env)?;
             }
+            if let Some(ref mut pw) = password {
+                pw.zeroize();
+            }
             return Ok(());
         }
         Some(Commands::Uninstall { client }) => {
@@ -554,10 +556,13 @@ async fn main() -> Result<()> {
             name,
             description,
             capabilities,
-            password,
+            mut password,
             network,
             install: auto_install,
         }) => {
+            if password.is_some() {
+                eprintln!("WARNING: --password is visible in process listings. Use ELISYM_AGENT_PASSWORD env var instead.");
+            }
             let net = network.as_deref().unwrap_or("devnet");
             run_init(
                 &name,
@@ -569,10 +574,13 @@ async fn main() -> Result<()> {
             )?;
             if auto_install {
                 let mut env = vec![("ELISYM_AGENT".to_string(), name)];
-                if let Some(pw) = password {
-                    env.push(("ELISYM_AGENT_PASSWORD".to_string(), pw));
+                if let Some(ref pw) = password {
+                    env.push(("ELISYM_AGENT_PASSWORD".to_string(), pw.clone()));
                 }
                 install::run_install(None, None, &env)?;
+            }
+            if let Some(ref mut pw) = password {
+                pw.zeroize();
             }
             return Ok(());
         }
@@ -643,6 +651,9 @@ async fn main() -> Result<()> {
     if cli.http {
         #[cfg(feature = "transport-http")]
         {
+            if cli.http_token.is_some() {
+                eprintln!("WARNING: --http-token is visible in process listings. Use ELISYM_HTTP_TOKEN env var instead.");
+            }
             let http_token = cli
                 .http_token
                 .or_else(|| std::env::var("ELISYM_HTTP_TOKEN").ok());
@@ -666,4 +677,61 @@ async fn main() -> Result<()> {
 
     tracing::info!("elisym MCP server stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_agent_names() {
+        assert!(validate_agent_name("my-agent").is_ok());
+        assert!(validate_agent_name("agent_1").is_ok());
+        assert!(validate_agent_name("AgentX").is_ok());
+        assert!(validate_agent_name("a").is_ok());
+    }
+
+    #[test]
+    fn empty_name() {
+        assert!(validate_agent_name("").is_err());
+    }
+
+    #[test]
+    fn path_traversal() {
+        assert!(validate_agent_name("../evil").is_err());
+        assert!(validate_agent_name("foo/bar").is_err());
+        assert!(validate_agent_name("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn hidden_dir() {
+        assert!(validate_agent_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn control_chars() {
+        assert!(validate_agent_name("agent\x00").is_err());
+        assert!(validate_agent_name("agent\n").is_err());
+        assert!(validate_agent_name("agent\t").is_err());
+    }
+
+    #[test]
+    fn spaces_rejected() {
+        assert!(validate_agent_name("my agent").is_err());
+    }
+
+    #[test]
+    fn too_long_name() {
+        let long = "a".repeat(65);
+        assert!(validate_agent_name(&long).is_err());
+        let ok = "a".repeat(64);
+        assert!(validate_agent_name(&ok).is_ok());
+    }
+
+    #[test]
+    fn shell_metacharacters() {
+        assert!(validate_agent_name("agent;rm").is_err());
+        assert!(validate_agent_name("agent$(cmd)").is_err());
+        assert!(validate_agent_name("agent`cmd`").is_err());
+    }
 }

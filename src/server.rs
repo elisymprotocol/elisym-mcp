@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,6 +33,79 @@ use crate::tools::wallet::SendPaymentInput;
 const PROTOCOL_FEE_BPS: u64 = 300;
 /// Solana address of the protocol treasury.
 const PROTOCOL_TREASURY: &str = "GY7vnWMkKpftU4nQ16C2ATkj1JwrQpHhknkaBUn67VTy";
+
+// ── Input length limits ──────────────────────────────────────────────
+const MAX_INPUT_LEN: usize = 100_000;
+const MAX_MESSAGE_LEN: usize = 50_000;
+const MAX_NPUB_LEN: usize = 128;
+const MAX_EVENT_ID_LEN: usize = 128;
+const MAX_PAYMENT_REQ_LEN: usize = 10_000;
+const MAX_DESCRIPTION_LEN: usize = 1_000;
+const MAX_CAPABILITIES: usize = 50;
+
+/// Validate that a string field does not exceed `max` bytes.
+fn check_len(field: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.len() > max {
+        Err(format!(
+            "{field} too long: {} bytes (max {max})",
+            value.len()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Cache for received job events.
+/// Insert and oldest-eviction are O(1). Removal by ID is O(n).
+pub struct JobEventsCache {
+    map: HashMap<EventId, Event>,
+    order: VecDeque<EventId>,
+}
+
+const JOB_CACHE_CAP: usize = 1000;
+
+impl JobEventsCache {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, id: EventId, event: Event) {
+        // If already present, update the event in place without duplicating in deque.
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.map.entry(id) {
+            e.insert(event);
+            return;
+        }
+        if self.map.len() >= JOB_CACHE_CAP {
+            if let Some(oldest_id) = self.order.pop_front() {
+                tracing::warn!(
+                    evicted_event = %oldest_id,
+                    "Job events cache full ({JOB_CACHE_CAP}), evicting oldest entry"
+                );
+                self.map.remove(&oldest_id);
+            }
+        }
+        self.map.insert(id, event);
+        self.order.push_back(id);
+    }
+
+    fn get(&self, id: &EventId) -> Option<&Event> {
+        self.map.get(id)
+    }
+
+    /// Remove by ID. O(n) due to deque scan.
+    fn remove(&mut self, id: &EventId) {
+        self.map.remove(id);
+        self.order.retain(|eid| eid != id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
 
 /// Parsed Solana payment request for fee validation.
 #[derive(Debug, Deserialize)]
@@ -86,15 +160,25 @@ fn validate_payment_fee(request: &str) -> Option<String> {
 }
 
 /// Truncate a string to `max` chars, appending "…" if truncated. UTF-8 safe.
-fn truncate_str(s: &str, max: usize) -> String {
-    // Single-pass using char_indices instead of iterating chars twice
-    let mut indices = s.char_indices();
-    if indices.nth(max).is_some() {
-        let end = s.char_indices().nth(max.saturating_sub(1)).map(|(i, _)| i).unwrap_or(s.len());
-        format!("{}…", &s[..end])
-    } else {
-        s.to_string()
+fn truncate_str(s: &str, max: usize) -> Cow<'_, str> {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => Cow::Owned(format!("{}…", &s[..i])),
+        None => Cow::Borrowed(s),
     }
+}
+
+/// Format lamports as SOL with 9 decimal places (integer math, no f64).
+fn format_sol(lamports: u64) -> String {
+    format!("{}.{:09} SOL", lamports / 1_000_000_000, lamports % 1_000_000_000)
+}
+
+/// Format lamports as SOL with 4 decimal places (integer math, no f64).
+fn format_sol_short(lamports: u64) -> String {
+    format!(
+        "{}.{:04} SOL",
+        lamports / 1_000_000_000,
+        (lamports % 1_000_000_000) / 100_000
+    )
 }
 
 /// Heartbeat message for ping/pong liveness checks (NIP-17 encrypted).
@@ -105,10 +189,67 @@ struct HeartbeatMessage {
     nonce: String,
 }
 
+/// Simple sliding-window rate limiter using atomics.
+/// Allows `max_calls` per `window_secs` second window.
+struct RateLimiter {
+    /// Packed: upper 32 bits = window start (unix secs truncated), lower 32 bits = count.
+    state: AtomicU64,
+    max_calls: u32,
+    window_secs: u32,
+}
+
+impl RateLimiter {
+    const fn new(max_calls: u32, window_secs: u32) -> Self {
+        Self {
+            state: AtomicU64::new(0),
+            max_calls,
+            window_secs,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        let window = now / self.window_secs;
+
+        loop {
+            let current = self.state.load(Ordering::Relaxed);
+            let stored_window = (current >> 32) as u32;
+            let count = current as u32;
+
+            let (new_window, new_count) = if stored_window == window {
+                if count >= self.max_calls {
+                    return Err(format!(
+                        "Rate limit exceeded: max {} calls per {}s. Try again shortly.",
+                        self.max_calls, self.window_secs
+                    ));
+                }
+                (window, count + 1)
+            } else {
+                (window, 1)
+            };
+
+            let new_state = ((new_window as u64) << 32) | (new_count as u64);
+            if self
+                .state
+                .compare_exchange_weak(current, new_state, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Rate limiter for payment and messaging tools (10 calls per 10s window).
+static TOOL_RATE_LIMITER: RateLimiter = RateLimiter::new(10, 10);
+
 pub struct ElisymServer {
     agent: Arc<AgentNode>,
     /// Stores raw events for received job requests (provider flow).
-    job_events: Arc<Mutex<HashMap<EventId, Event>>>,
+    job_cache: Arc<Mutex<JobEventsCache>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -117,7 +258,7 @@ impl ElisymServer {
     pub fn new(agent: AgentNode) -> Self {
         Self {
             agent: Arc::new(agent),
-            job_events: Arc::new(Mutex::new(HashMap::new())),
+            job_cache: Arc::new(Mutex::new(JobEventsCache::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -126,11 +267,11 @@ impl ElisymServer {
     #[cfg(feature = "transport-http")]
     pub fn from_shared(
         agent: Arc<AgentNode>,
-        job_events: Arc<Mutex<HashMap<EventId, Event>>>,
+        job_cache: Arc<Mutex<JobEventsCache>>,
     ) -> Self {
         Self {
             agent,
-            job_events,
+            job_cache,
             tool_router: Self::tool_router(),
         }
     }
@@ -219,7 +360,8 @@ impl ElisymServer {
         let filter_network = input.network.unwrap_or_else(|| "devnet".into());
         let fetch_timeout = Some(std::time::Duration::from_secs(timeout_secs));
 
-        // 1. Discover all agents and filter by chain + network
+        // 1. Discover all agents and filter by chain + network locally.
+        //    Protocol-level filtering by chain/network is not yet supported in elisym-core.
         let filter = elisym_core::AgentFilter::default();
         let all_agents = match self.agent.discovery.search_agents(&filter).await {
             Ok(a) => a,
@@ -301,7 +443,6 @@ impl ElisymServer {
 
         // Total earned across ALL agents in this network
         let total_earned_lamports: u64 = earnings.values().sum();
-        let total_earned_sol = total_earned_lamports as f64 / 1_000_000_000.0;
 
         // 4. Build agent list with earnings, filter out observers
         struct AgentRow {
@@ -327,11 +468,11 @@ impl ElisymServer {
                 let price_str = if price == 0 {
                     "—".into()
                 } else {
-                    format!("{:.4} SOL", price as f64 / 1_000_000_000.0)
+                    format_sol_short(price)
                 };
                 AgentRow {
                     name: a.card.name.clone(),
-                    npub: truncate_str(&npub, 20),
+                    npub: truncate_str(&npub, 20).into_owned(),
                     capabilities: a.card.capabilities.join(", "),
                     price: price_str,
                     earned,
@@ -346,11 +487,11 @@ impl ElisymServer {
         let mut output = String::new();
         output.push_str(&format!(
             "elisym Network Dashboard ({}/{})\n\
-             Agents: {}  |  Total Earned (30d): {:.4} SOL  |  Job Results: {}\n\n",
+             Agents: {}  |  Total Earned (30d): {}  |  Job Results: {}\n\n",
             filter_chain,
             filter_network,
             agents.len(),
-            total_earned_sol,
+            format_sol_short(total_earned_lamports),
             total_job_results,
         ));
 
@@ -371,7 +512,7 @@ impl ElisymServer {
                 let earned_str = if row.earned == 0 {
                     "—".into()
                 } else {
-                    format!("{:.4} SOL", row.earned as f64 / 1_000_000_000.0)
+                    format_sol_short(row.earned)
                 };
                 output.push_str(&format!(
                     "{:<20} {:<20} {:<30} {:>12} {:>12}\n",
@@ -403,6 +544,14 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<CreateJobInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = check_len("input", &input.input, MAX_INPUT_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Some(ref npub) = input.provider_npub {
+            if let Err(err) = check_len("provider_npub", npub, MAX_NPUB_LEN) {
+                return Ok(CallToolResult::error(vec![Content::text(err)]));
+            }
+        }
         let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
         let input_type = input.input_type.as_deref().unwrap_or("text");
         let tags = input.tags.unwrap_or_default();
@@ -447,6 +596,9 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<GetJobResultInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = check_len("job_event_id", &input.job_event_id, MAX_EVENT_ID_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
         let timeout_secs = input.timeout_secs.unwrap_or(60);
 
         let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
@@ -509,6 +661,9 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<GetJobFeedbackInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = check_len("job_event_id", &input.job_event_id, MAX_EVENT_ID_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
         let timeout_secs = input.timeout_secs.unwrap_or(60);
 
         let mut rx = match self.agent.marketplace.subscribe_to_feedback().await {
@@ -569,6 +724,15 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<SubmitAndPayJobInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = TOOL_RATE_LIMITER.check() {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = check_len("input", &input.input, MAX_INPUT_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = check_len("provider_npub", &input.provider_npub, MAX_NPUB_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
         let provider_pk = match PublicKey::from_bech32(&input.provider_npub) {
             Ok(pk) => pk,
             Err(e) => {
@@ -636,11 +800,23 @@ impl ElisymServer {
             tokio::time::Instant::now() + tokio::time::Duration::from_secs(total_timeout);
         let mut status_log = vec![format!("Job submitted. Event ID: {event_id}")];
         let mut paid = false;
+        let mut feedback_closed = false;
+        let mut result_closed = false;
 
         // 3. Event loop: handle feedback and results
         loop {
             tokio::select! {
-                Some(fb) = feedback_rx.recv() => {
+                fb_opt = feedback_rx.recv(), if !feedback_closed => {
+                    let Some(fb) = fb_opt else {
+                        feedback_closed = true;
+                        if result_closed {
+                            status_log.push("Both channels closed unexpectedly.".into());
+                            return Ok(CallToolResult::error(vec![Content::text(
+                                status_log.join("\n")
+                            )]));
+                        }
+                        continue;
+                    };
                     if fb.request_id != event_id {
                         continue;
                     }
@@ -675,7 +851,7 @@ impl ElisymServer {
                                         )]));
                                     }
                                 };
-                                match provider.pay(payment_request) {
+                                match tokio::task::block_in_place(|| provider.pay(payment_request)) {
                                     Ok(result) => {
                                         status_log.push(format!(
                                             "Payment sent: {} ({})",
@@ -703,7 +879,17 @@ impl ElisymServer {
                         }
                     }
                 }
-                Some(result) = result_rx.recv() => {
+                res_opt = result_rx.recv(), if !result_closed => {
+                    let Some(result) = res_opt else {
+                        result_closed = true;
+                        if feedback_closed {
+                            status_log.push("Both channels closed unexpectedly.".into());
+                            return Ok(CallToolResult::error(vec![Content::text(
+                                status_log.join("\n")
+                            )]));
+                        }
+                        continue;
+                    };
                     if result.request_id != event_id {
                         continue;
                     }
@@ -733,6 +919,9 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<PingAgentInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = check_len("agent_npub", &input.agent_npub, MAX_NPUB_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
         let target = match PublicKey::from_bech32(&input.agent_npub) {
             Ok(pk) => pk,
             Err(e) => {
@@ -816,6 +1005,15 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<SendMessageInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = TOOL_RATE_LIMITER.check() {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = check_len("message", &input.message, MAX_MESSAGE_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = check_len("recipient_npub", &input.recipient_npub, MAX_NPUB_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
         let recipient = match PublicKey::from_bech32(&input.recipient_npub) {
             Ok(pk) => pk,
             Err(e) => {
@@ -899,11 +1097,8 @@ impl ElisymServer {
     // Wallet tools
     // ══════════════════════════════════════════════════════════════
 
-    // Note: this is a sync fn that makes a blocking RPC call on the tokio runtime.
-    // Acceptable for now since balance queries are short-lived. Consider spawn_blocking
-    // if latency becomes a concern.
     #[tool(description = "Get the Solana wallet balance for this agent. Returns the address and balance in SOL. Requires Solana payments to be configured via ELISYM_AGENT.")]
-    fn get_balance(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+    async fn get_balance(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let Some(provider) = self.agent.solana_payments() else {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
@@ -911,11 +1106,11 @@ impl ElisymServer {
         };
 
         let address = provider.address();
-        match provider.balance() {
+        match tokio::task::block_in_place(|| provider.balance()) {
             Ok(lamports) => {
-                let sol = lamports as f64 / 1_000_000_000.0;
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Address: {address}\nBalance: {sol:.9} SOL ({lamports} lamports)"
+                    "Address: {address}\nBalance: {} ({lamports} lamports)",
+                    format_sol(lamports)
                 ))]))
             }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
@@ -924,12 +1119,18 @@ impl ElisymServer {
         }
     }
 
-    // Note: sync fn with blocking RPC call (see get_balance comment above).
     #[tool(description = "Pay a Solana payment request (from a provider's job feedback). Validates protocol fee before sending. Requires Solana payments to be configured via ELISYM_AGENT.")]
-    fn send_payment(
+    async fn send_payment(
         &self,
         Parameters(input): Parameters<SendPaymentInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = TOOL_RATE_LIMITER.check() {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = check_len("payment_request", &input.payment_request, MAX_PAYMENT_REQ_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+
         let Some(provider) = self.agent.solana_payments() else {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
@@ -943,7 +1144,7 @@ impl ElisymServer {
             ))]));
         }
 
-        match provider.pay(&input.payment_request) {
+        match tokio::task::block_in_place(|| provider.pay(&input.payment_request)) {
             Ok(result) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Payment sent successfully.\nTransaction: {}\nStatus: {}",
                 result.payment_id, result.status
@@ -987,24 +1188,9 @@ impl ElisymServer {
                 let customer_npub = job.customer.to_bech32().unwrap_or_default();
 
                 // Store the raw event for later use in feedback/result.
-                // Cap at 1000 entries to prevent unbounded growth; evict oldest.
                 {
-                    let mut map = self.job_events.lock().await;
-                    if map.len() >= 1000 {
-                        // Remove the entry with the lowest (oldest) created_at
-                        if let Some(oldest_id) = map
-                            .iter()
-                            .min_by_key(|(_, ev)| ev.created_at)
-                            .map(|(id, _)| *id)
-                        {
-                            tracing::warn!(
-                                evicted_event = %oldest_id,
-                                "Job events cache full (1000), evicting oldest entry"
-                            );
-                            map.remove(&oldest_id);
-                        }
-                    }
-                    map.insert(event_id, job.raw_event);
+                    let mut cache = self.job_cache.lock().await;
+                    cache.insert(event_id, job.raw_event);
                 }
 
                 let info = serde_json::json!({
@@ -1034,6 +1220,14 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<SendJobFeedbackInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = check_len("job_event_id", &input.job_event_id, MAX_EVENT_ID_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Some(ref pr) = input.payment_request {
+            if let Err(err) = check_len("payment_request", pr, MAX_PAYMENT_REQ_LEN) {
+                return Ok(CallToolResult::error(vec![Content::text(err)]));
+            }
+        }
         let event_id = match EventId::parse(&input.job_event_id) {
             Ok(id) => id,
             Err(e) => {
@@ -1043,7 +1237,7 @@ impl ElisymServer {
             }
         };
 
-        let raw_event = match self.job_events.lock().await.get(&event_id) {
+        let raw_event = match self.job_cache.lock().await.get(&event_id) {
             Some(ev) => ev.clone(),
             None => {
                 return Ok(CallToolResult::error(vec![Content::text(
@@ -1098,6 +1292,12 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<SubmitJobResultInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = check_len("content", &input.content, MAX_INPUT_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = check_len("job_event_id", &input.job_event_id, MAX_EVENT_ID_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
         let event_id = match EventId::parse(&input.job_event_id) {
             Ok(id) => id,
             Err(e) => {
@@ -1107,7 +1307,7 @@ impl ElisymServer {
             }
         };
 
-        let raw_event = match self.job_events.lock().await.get(&event_id) {
+        let raw_event = match self.job_cache.lock().await.get(&event_id) {
             Some(ev) => ev.clone(),
             None => {
                 return Ok(CallToolResult::error(vec![Content::text(
@@ -1124,7 +1324,7 @@ impl ElisymServer {
         {
             Ok(result_id) => {
                 // Clean up stored event
-                self.job_events.lock().await.remove(&event_id);
+                self.job_cache.lock().await.remove(&event_id);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Result delivered. Event ID: {result_id}"
                 ))]))
@@ -1136,10 +1336,23 @@ impl ElisymServer {
     }
 
     #[tool(description = "Generate a Solana payment request with 3% protocol fee to send to a customer (provider mode). Returns a JSON object with the request string to use in send_job_feedback with status 'payment-required'.")]
-    fn create_payment_request(
+    async fn create_payment_request(
         &self,
         Parameters(input): Parameters<CreatePaymentRequestInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = TOOL_RATE_LIMITER.check() {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = check_len("description", &input.description, MAX_DESCRIPTION_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+
+        if input.amount == 0 {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Amount must be greater than 0.",
+            )]));
+        }
+
         let Some(provider) = self.agent.solana_payments() else {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
@@ -1149,15 +1362,15 @@ impl ElisymServer {
         let expiry = input.expiry_secs.unwrap_or(600);
         // Fee rounds up to nearest lamport (div_ceil favors protocol)
         let fee_amount = (input.amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
-        match provider.create_payment_request_with_fee(
+        match tokio::task::block_in_place(|| provider.create_payment_request_with_fee(
             input.amount,
             &input.description,
             expiry,
             PROTOCOL_TREASURY,
             fee_amount,
-        ) {
+        )) {
             Ok(req) => {
-                let provider_net = input.amount - fee_amount;
+                let provider_net = input.amount.saturating_sub(fee_amount);
                 let result = serde_json::json!({
                     "payment_request": req.request,
                     "amount_lamports": req.amount,
@@ -1175,17 +1388,21 @@ impl ElisymServer {
     }
 
     #[tool(description = "Check whether a payment request has been paid (provider mode). Use this after sending a PaymentRequired feedback to verify the customer has paid before processing the job.")]
-    fn check_payment_status(
+    async fn check_payment_status(
         &self,
         Parameters(input): Parameters<CheckPaymentStatusInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = check_len("payment_request", &input.payment_request, MAX_PAYMENT_REQ_LEN) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+
         let Some(provider) = self.agent.solana_payments() else {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
             )]));
         };
 
-        match provider.lookup_payment(&input.payment_request) {
+        match tokio::task::block_in_place(|| provider.lookup_payment(&input.payment_request)) {
             Ok(status) => {
                 let settled = if status.settled { "Yes" } else { "No" };
                 let amount_info = status
@@ -1207,6 +1424,14 @@ impl ElisymServer {
         &self,
         Parameters(input): Parameters<PublishCapabilitiesInput>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Some(ref kinds) = input.supported_kinds {
+            if kinds.len() > MAX_CAPABILITIES {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Too many supported_kinds: {} (max {MAX_CAPABILITIES})",
+                    kinds.len()
+                ))]));
+            }
+        }
         let supported_kinds = input.supported_kinds.unwrap_or_else(|| vec![DEFAULT_KIND_OFFSET]);
 
         // Update capability card metadata with job_price if provided
@@ -1317,13 +1542,13 @@ impl ServerHandler for ElisymServer {
                 };
 
                 let address = provider.address();
-                let balance = provider.balance().unwrap_or(0);
-                let sol = balance as f64 / 1_000_000_000.0;
+                let balance =
+                    tokio::task::block_in_place(|| provider.balance()).unwrap_or(0);
 
                 let wallet = serde_json::json!({
                     "address": address,
                     "balance_lamports": balance,
-                    "balance_sol": format!("{sol:.9}"),
+                    "balance_sol": format_sol(balance),
                     "chain": "solana",
                 });
                 let json = serde_json::to_string_pretty(&wallet).unwrap_or_default();
@@ -1337,5 +1562,234 @@ impl ServerHandler for ElisymServer {
                 Some(serde_json::json!({ "uri": uri })),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── JobEventsCache ──────────────────────────────────────────────
+
+    fn dummy_event(id_byte: u8) -> (EventId, Event) {
+        let keys = nostr_sdk::Keys::generate();
+        let builder = nostr_sdk::EventBuilder::text_note(format!("test-{id_byte}"));
+        let event = builder.sign_with_keys(&keys).unwrap();
+        (event.id, event)
+    }
+
+    #[test]
+    fn cache_insert_and_get() {
+        let mut cache = JobEventsCache::new();
+        let (id, event) = dummy_event(1);
+        cache.insert(id, event.clone());
+        assert!(cache.get(&id).is_some());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cache_insert_duplicate_no_deque_bloat() {
+        let mut cache = JobEventsCache::new();
+        let (id, event) = dummy_event(1);
+        cache.insert(id, event.clone());
+        cache.insert(id, event.clone());
+        cache.insert(id, event);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+    }
+
+    #[test]
+    fn cache_eviction_at_capacity() {
+        let mut cache = JobEventsCache::new();
+        let mut ids = Vec::new();
+        for i in 0..JOB_CACHE_CAP {
+            let (id, event) = dummy_event(i as u8);
+            ids.push(id);
+            cache.insert(id, event);
+        }
+        assert_eq!(cache.len(), JOB_CACHE_CAP);
+        // Insert one more — oldest should be evicted
+        let (new_id, new_event) = dummy_event(255);
+        cache.insert(new_id, new_event);
+        assert_eq!(cache.len(), JOB_CACHE_CAP);
+        assert!(cache.get(&ids[0]).is_none());
+        assert!(cache.get(&new_id).is_some());
+    }
+
+    #[test]
+    fn cache_remove() {
+        let mut cache = JobEventsCache::new();
+        let (id, event) = dummy_event(1);
+        cache.insert(id, event);
+        cache.remove(&id);
+        assert!(cache.get(&id).is_none());
+        assert_eq!(cache.len(), 0);
+        assert!(cache.order.is_empty());
+    }
+
+    // ── check_len ───────────────────────────────────────────────────
+
+    #[test]
+    fn check_len_within_limit() {
+        assert!(check_len("field", "hello", 10).is_ok());
+    }
+
+    #[test]
+    fn check_len_exceeds_limit() {
+        assert!(check_len("field", "hello", 3).is_err());
+    }
+
+    #[test]
+    fn check_len_exact_boundary() {
+        assert!(check_len("field", "abc", 3).is_ok());
+    }
+
+    // ── truncate_str ────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_str_no_truncation() {
+        let result = truncate_str("hello", 10);
+        assert_eq!(&*result, "hello");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn truncate_str_truncation() {
+        let result = truncate_str("hello world", 5);
+        assert_eq!(&*result, "hello…");
+    }
+
+    #[test]
+    fn truncate_str_unicode_safe() {
+        // Multi-byte chars should not panic
+        let result = truncate_str("Привет мир", 6);
+        assert_eq!(&*result, "Привет…");
+    }
+
+    // ── validate_payment_fee ────────────────────────────────────────
+
+    fn make_payment_json(amount: u64, fee_address: Option<&str>, fee_amount: Option<u64>) -> String {
+        let mut obj = serde_json::json!({
+            "recipient": "SomeAddress",
+            "amount": amount,
+            "reference": "ref123",
+        });
+        if let Some(addr) = fee_address {
+            obj["fee_address"] = serde_json::json!(addr);
+        }
+        if let Some(amt) = fee_amount {
+            obj["fee_amount"] = serde_json::json!(amt);
+        }
+        serde_json::to_string(&obj).unwrap()
+    }
+
+    #[test]
+    fn valid_fee() {
+        let amount = 10_000_000u64;
+        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
+        assert!(validate_payment_fee(&json).is_none());
+    }
+
+    #[test]
+    fn wrong_treasury_address() {
+        let amount = 10_000_000u64;
+        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let json = make_payment_json(amount, Some("WrongAddress"), Some(fee));
+        let err = validate_payment_fee(&json).unwrap();
+        assert!(err.contains("Fee address mismatch"));
+    }
+
+    #[test]
+    fn wrong_fee_amount() {
+        let amount = 10_000_000u64;
+        let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(1));
+        let err = validate_payment_fee(&json).unwrap();
+        assert!(err.contains("Fee amount mismatch"));
+    }
+
+    #[test]
+    fn missing_fee() {
+        let json = make_payment_json(10_000_000, None, None);
+        let err = validate_payment_fee(&json).unwrap();
+        assert!(err.contains("missing protocol fee"));
+    }
+
+    #[test]
+    fn invalid_json() {
+        assert!(validate_payment_fee("not json").is_some());
+    }
+
+    // ── format_sol ──────────────────────────────────────────────────
+
+    #[test]
+    fn format_sol_zero() {
+        assert_eq!(format_sol(0), "0.000000000 SOL");
+    }
+
+    #[test]
+    fn format_sol_one_sol() {
+        assert_eq!(format_sol(1_000_000_000), "1.000000000 SOL");
+    }
+
+    #[test]
+    fn format_sol_fractional() {
+        assert_eq!(format_sol(1_500_000_000), "1.500000000 SOL");
+    }
+
+    #[test]
+    fn format_sol_short_zero() {
+        assert_eq!(format_sol_short(0), "0.0000 SOL");
+    }
+
+    #[test]
+    fn format_sol_short_one_sol() {
+        assert_eq!(format_sol_short(1_000_000_000), "1.0000 SOL");
+    }
+
+    #[test]
+    fn format_sol_short_fractional() {
+        assert_eq!(format_sol_short(10_000_000), "0.0100 SOL");
+    }
+
+    // ── fee calculation ─────────────────────────────────────────────
+
+    #[test]
+    fn fee_calculation_standard() {
+        let amount = 10_000_000u64;
+        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        assert_eq!(fee, 300_000); // 3% of 10M
+    }
+
+    #[test]
+    fn fee_calculation_rounds_up() {
+        // 1 lamport: (1 * 300) / 10_000 = 0.03 → rounds up to 1
+        let fee = (1u64 * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        assert_eq!(fee, 1);
+    }
+
+    #[test]
+    fn fee_calculation_zero() {
+        let fee = (0u64 * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        assert_eq!(fee, 0);
+    }
+
+    // ── RateLimiter ─────────────────────────────────────────────────
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let limiter = RateLimiter::new(5, 10);
+        for _ in 0..5 {
+            assert!(limiter.check().is_ok());
+        }
+    }
+
+    #[test]
+    fn rate_limiter_rejects_over_limit() {
+        let limiter = RateLimiter::new(3, 10);
+        for _ in 0..3 {
+            assert!(limiter.check().is_ok());
+        }
+        assert!(limiter.check().is_err());
     }
 }
