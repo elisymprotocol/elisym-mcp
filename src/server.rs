@@ -980,6 +980,7 @@ impl ElisymServer {
                     // Always handle errors, even after payment
                     if fb.status.as_str() == "error" {
                         let info = fb.extra_info.as_deref().unwrap_or("unknown error");
+                        tracing::warn!(event_id = %event_id, error = %info, "Provider returned error");
                         status_log.push(format!("Provider error: {info}"));
                         return Ok(CallToolResult::error(vec![Content::text(
                             status_log.join("\n")
@@ -991,6 +992,7 @@ impl ElisymServer {
                     }
                     match fb.status.as_str() {
                         "payment-required" => {
+                            tracing::info!(event_id = %event_id, "Provider requested payment");
                             if let Some(payment_request) = &fb.payment_request {
                                 // Validate fee before paying
                                 if let Some(err) = validate_payment_fee(payment_request) {
@@ -1016,7 +1018,7 @@ impl ElisymServer {
                                             result.payment_id, result.status
                                         ));
                                         paid = true;
-                                        tracing::info!("Payment sent, waiting for result");
+                                        tracing::info!(event_id = %event_id, payment_id = %result.payment_id, "Payment sent, waiting for result");
                                     }
                                     Ok(Err(e)) => {
                                         status_log.push(format!("Payment failed: {e}"));
@@ -1036,9 +1038,11 @@ impl ElisymServer {
                             }
                         }
                         "processing" => {
+                            tracing::info!(event_id = %event_id, "Provider is processing the job");
                             status_log.push("Provider is processing the job...".into());
                         }
                         other => {
+                            tracing::info!(event_id = %event_id, status = %other, "Provider feedback received");
                             status_log.push(format!("Feedback: {other}"));
                         }
                     }
@@ -1057,6 +1061,7 @@ impl ElisymServer {
                     if result.request_id != event_id {
                         continue;
                     }
+                    tracing::info!(event_id = %event_id, content_len = result.content.len(), "Result received from provider");
                     let amount_info = result
                         .amount
                         .map(|a| format!(" (amount: {a} lamports)"))
