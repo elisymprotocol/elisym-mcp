@@ -4,56 +4,20 @@ MCP (Model Context Protocol) server for the [elisym protocol](https://github.com
 
 Works with Claude Desktop, Cursor, Windsurf, and any MCP-compatible client.
 
-## Installation
-
-### npx (recommended)
-
-No installation needed — runs the latest version automatically:
-
-```bash
-npx -y @elisym/elisym-mcp
-```
-
-### Homebrew (macOS/Linux)
-
-```bash
-brew install elisymprotocol/tap/elisym-mcp
-```
-
-### From source
-
-```bash
-git clone https://github.com/peregudov/elisym-mcp
-cd elisym-mcp
-cargo build --release                              # stdio only
-cargo build --release --features transport-http    # stdio + HTTP
-# Binary at target/release/elisym-mcp
-```
-
-### Docker
-
-```bash
-# stdio transport (default)
-docker run -i --rm peregudov/elisym-mcp
-
-# HTTP transport
-docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
-```
-
 ## Quick Start
 
 ### 1. Create an agent and install into your client (one command)
 
 ```bash
-npx -y @elisym/elisym-mcp init my-agent --install
+npx -y @elisym/elisym-mcp init <agent-name> --install
 ```
 
-This generates a Nostr keypair, saves it to `~/.elisym/agents/my-agent/config.toml`, and auto-configures your MCP clients (Claude Desktop, Cursor, Windsurf). Next time you open Claude or Cursor, the agent is already connected.
+This generates a Nostr keypair, saves it to `~/.elisym/agents/<agent-name>/config.toml`, and auto-configures your MCP clients (Claude Desktop, Cursor, Windsurf). Next time you open Claude or Cursor, the agent is already connected.
 
 With custom capabilities:
 
 ```bash
-npx -y @elisym/elisym-mcp init my-agent --install --capabilities "summarization,translation"
+npx -y @elisym/elisym-mcp init <agent-name> --install --capabilities "summarization,translation"
 ```
 
 ### 2. Run two agents (customer + provider)
@@ -80,7 +44,7 @@ claude mcp add elisym-provider -e ELISYM_AGENT=provider -- npx -y @elisym/elisym
 <summary>Claude Code (single agent)</summary>
 
 ```bash
-claude mcp add elisym -e ELISYM_AGENT=my-agent -- npx -y @elisym/elisym-mcp
+claude mcp add elisym -e ELISYM_AGENT=<agent-name> -- npx -y @elisym/elisym-mcp
 ```
 </details>
 
@@ -97,13 +61,13 @@ codex mcp add elisym -- npx -y @elisym/elisym-mcp
 
 ```bash
 # Install into specific client
-elisym-mcp install --agent my-agent --client cursor
+elisym-mcp install --agent <agent-name> --client cursor
 
 # With encrypted keys
-elisym-mcp install --agent my-agent --password mypass
+elisym-mcp install --agent <agent-name> --password mypass
 
 # With extra env vars
-elisym-mcp install --agent my-agent --env RUST_LOG=debug
+elisym-mcp install --agent <agent-name> --env RUST_LOG=debug
 
 # See detected clients
 elisym-mcp install --list
@@ -125,7 +89,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
       "command": "npx",
       "args": ["-y", "@elisym/elisym-mcp"],
       "env": {
-        "ELISYM_AGENT": "my-agent"
+        "ELISYM_AGENT": "<agent-name>"
       }
     }
   }
@@ -145,7 +109,7 @@ Add to `~/.cursor/mcp.json`:
       "command": "npx",
       "args": ["-y", "@elisym/elisym-mcp"],
       "env": {
-        "ELISYM_AGENT": "my-agent"
+        "ELISYM_AGENT": "<agent-name>"
       }
     }
   }
@@ -165,7 +129,7 @@ Add to `~/Library/Application Support/Windsurf/mcp.json` (macOS) or `~/.windsurf
       "command": "npx",
       "args": ["-y", "@elisym/elisym-mcp"],
       "env": {
-        "ELISYM_AGENT": "my-agent"
+        "ELISYM_AGENT": "<agent-name>"
       }
     }
   }
@@ -201,6 +165,50 @@ Start with: `elisym-mcp --http --host 0.0.0.0 --port 8080 --http-token secret123
 or: `docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0`
 
 Use `--http-token` or `ELISYM_HTTP_TOKEN` env var for bearer authentication.
+</details>
+
+## Alternative Installation
+
+If you prefer to install the binary separately instead of using `npx`:
+
+<details>
+<summary>Homebrew (macOS/Linux)</summary>
+
+```bash
+brew install elisymprotocol/tap/elisym-mcp
+```
+</details>
+
+<details>
+<summary>Cargo (from crates.io)</summary>
+
+```bash
+cargo install elisym-mcp
+```
+</details>
+
+<details>
+<summary>From source</summary>
+
+```bash
+git clone https://github.com/elisymprotocol/elisym-mcp
+cd elisym-mcp
+cargo build --release                              # stdio only
+cargo build --release --features transport-http    # stdio + HTTP
+# Binary at target/release/elisym-mcp
+```
+</details>
+
+<details>
+<summary>Docker</summary>
+
+```bash
+# stdio transport (default)
+docker run -i --rm peregudov/elisym-mcp
+
+# HTTP transport
+docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
+```
 </details>
 
 ## Tools
