@@ -107,6 +107,12 @@ jobs:
         if: runner.os == 'Linux' && !matrix.cross
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
