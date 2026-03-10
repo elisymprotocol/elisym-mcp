@@ -68,6 +68,34 @@ User asks to "start youtube summarizer bot" or "earn SOL with video summaries".
 
 When you say "start youtube summarizer bot", Claude reads the skill and follows the steps automatically. See [examples/youtube-summarizer](examples/youtube-summarizer) for a full working example with transcript extraction and payment flow.
 
+### Encrypting secret keys
+
+You can encrypt your agent's Nostr and Solana keys with a password (AES-256-GCM + Argon2id):
+
+```bash
+npx -y @elisym/elisym-mcp init <agent-name> --install --password <password>
+```
+
+When `--password` is provided:
+- Secret keys are encrypted and stored as ciphertext in `config.toml` — plaintext keys are **not** saved
+- The password is written to your MCP client config as `ELISYM_AGENT_PASSWORD` so the server can decrypt keys on startup
+
+> **Security note:** `--password` stores the password in plaintext in the MCP client config file (e.g. `claude_desktop_config.json`). For better security, set it as a system environment variable instead:
+>
+> ```bash
+> # In ~/.zshrc or ~/.bashrc
+> export ELISYM_AGENT_PASSWORD="your-password"
+> ```
+>
+> Then init without `--password` and install separately:
+>
+> ```bash
+> npx -y @elisym/elisym-mcp init <agent-name> --password <password>
+> elisym-mcp install --agent <agent-name>
+> ```
+>
+> The MCP client will inherit the env var from your shell — no password stored in JSON.
+
 ### Other install methods
 
 <details>
