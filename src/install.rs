@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -83,21 +84,39 @@ fn windsurf_config() -> Option<PathBuf> {
     }
 }
 
+/// Path to Claude Code user config (~/.claude.json).
+fn claude_code_config() -> Option<PathBuf> {
+    home().map(|h| h.join(".claude.json"))
+}
+
+/// Check if Claude Code is installed (config file exists or `claude` in PATH).
+fn is_claude_code_installed() -> bool {
+    // Check if ~/.claude.json exists (Claude Code has been run at least once)
+    if claude_code_config().is_some_and(|p| p.exists()) {
+        return true;
+    }
+    // Fallback: check if `claude` binary is in PATH
+    Command::new("claude")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Resolve the elisym-mcp binary path for the config.
+/// Uses the current exe path if it exists on disk, otherwise falls back to npx.
 fn resolve_command() -> (String, Vec<String>) {
-    // If installed via cargo/brew, use the binary name directly
     if let Ok(path) = std::env::current_exe() {
-        let path_str = path.to_string_lossy().to_string();
-        // If running from a standard install location, use the path
-        if path_str.contains(".cargo/bin")
-            || path_str.contains("/usr/local/bin")
-            || path_str.contains("/opt/homebrew")
-        {
-            return (path_str, vec![]);
+        // Resolve symlinks to get the real path
+        let resolved = path.canonicalize().unwrap_or(path);
+        if resolved.exists() {
+            return (resolved.to_string_lossy().to_string(), vec![]);
         }
     }
-    // Default to npx
-    ("npx".to_string(), vec!["-y".to_string(), "elisym-mcp".to_string()])
+    // Fallback: npx wrapper
+    ("npx".to_string(), vec!["-y".to_string(), "@elisym/elisym-mcp".to_string()])
 }
 
 fn build_server_entry(agent: Option<&str>, env: &[(String, String)]) -> Value {
@@ -189,6 +208,36 @@ fn install_to_config(path: &PathBuf, agent: Option<&str>, env: &[(String, String
     Ok(true)
 }
 
+/// Check if elisym is already configured in any MCP client.
+pub fn is_installed() -> bool {
+    for client in CLIENTS {
+        if let Some(path) = (client.config_path)() {
+            if path.exists() {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if let Ok(config) = serde_json::from_str::<Value>(&contents) {
+                        if config.get("mcpServers").and_then(|s| s.get("elisym")).is_some() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Check Claude Code config
+    if let Some(path) = claude_code_config() {
+        if path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(config) = serde_json::from_str::<Value>(&contents) {
+                    if config.get("mcpServers").and_then(|s| s.get("elisym")).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn run_list() {
     println!("Detected MCP clients:\n");
     let mut found = false;
@@ -227,15 +276,39 @@ pub fn run_list() {
         }
     }
 
-    if !found {
-        println!("  No supported MCP clients found.");
-        println!("\n  Supported: Claude Desktop, Cursor, Windsurf");
+    // Claude Code (~/.claude.json)
+    if let Some(path) = claude_code_config() {
+        if is_claude_code_installed() {
+            let status = if path.exists() {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if let Ok(config) = serde_json::from_str::<Value>(&contents) {
+                        if config.get("mcpServers").and_then(|s| s.get("elisym")).is_some() {
+                            "installed"
+                        } else {
+                            "available"
+                        }
+                    } else {
+                        "available"
+                    }
+                } else {
+                    "available"
+                }
+            } else {
+                "available (no config file yet)"
+            };
+            println!("  {:<20} {} [{}]", "claude-code", path.display(), status);
+            found = true;
+        }
     }
 
-    // Also check Claude Code CLI
+    if !found {
+        println!("  No supported MCP clients found.");
+        println!("\n  Supported: Claude Desktop, Cursor, Windsurf, Claude Code");
+    }
+
+    // Other CLI clients
     println!();
-    println!("CLI clients (use their own install commands):");
-    println!("  claude-code         claude mcp add elisym -- npx -y elisym-mcp");
+    println!("Other CLI clients:");
     println!("  codex               codex mcp add elisym -- npx -y elisym-mcp");
 }
 
@@ -275,6 +348,28 @@ pub fn run_install(client_filter: Option<&str>, agent: Option<&str>, env: &[(Str
             }
             Err(e) => {
                 eprintln!("  Error installing to {}: {e}", client.name);
+            }
+        }
+    }
+
+    // Claude Code (~/.claude.json — user scope, global)
+    let claude_code_matches = client_filter.is_none() || client_filter == Some("claude-code");
+    if claude_code_matches && is_claude_code_installed() {
+        if let Some(path) = claude_code_config() {
+            match install_to_config(&path, agent, env) {
+                Ok(true) => {
+                    println!("  Installed to claude-code ({}, global)", path.display());
+                    installed += 1;
+                }
+                Ok(false) => {
+                    println!(
+                        "  Already installed in claude-code. To update, run: elisym-mcp uninstall && elisym-mcp install ..."
+                    );
+                    skipped += 1;
+                }
+                Err(e) => {
+                    eprintln!("  Error installing to claude-code: {e}");
+                }
             }
         }
     }
@@ -328,6 +423,32 @@ pub fn run_uninstall(client_filter: Option<&str>) -> Result<()> {
                 std::fs::rename(&tmp, &path)?;
                 println!("  Removed from {} ({})", client.name, path.display());
                 removed += 1;
+            }
+        }
+    }
+
+    // Claude Code (~/.claude.json)
+    let claude_code_matches = client_filter.is_none() || client_filter == Some("claude-code");
+    if claude_code_matches {
+        if let Some(path) = claude_code_config() {
+            if path.exists() {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    if let Ok(mut config) = serde_json::from_str::<Value>(&contents) {
+                        if let Some(servers) = config.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+                            if servers.remove("elisym").is_some() {
+                                if let Ok(json) = serde_json::to_string_pretty(&config) {
+                                    let tmp = path.with_extension("json.tmp");
+                                    if std::fs::write(&tmp, json + "\n").is_ok()
+                                        && std::fs::rename(&tmp, &path).is_ok()
+                                    {
+                                        println!("  Removed from claude-code ({})", path.display());
+                                        removed += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

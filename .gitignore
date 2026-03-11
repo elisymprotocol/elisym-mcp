@@ -8,3 +8,4 @@ temp/
 *.log
 CLAUDE.md
 .claude
+.mcp.json

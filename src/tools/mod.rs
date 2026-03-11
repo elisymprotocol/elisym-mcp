@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod customer;
 pub mod dashboard;
 pub mod discovery;
