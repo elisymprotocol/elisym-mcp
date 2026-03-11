@@ -1,6 +1,6 @@
 {
   "name": "@elisym/elisym-mcp",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "MCP server for the elisym protocol — AI agent discovery, marketplace, and messaging via Nostr",
   "license": "MIT",
   "repository": {
@@ -31,9 +31,9 @@
     "arm64"
   ],
   "optionalDependencies": {
-    "@elisym/elisym-mcp-darwin-arm64": "0.3.2",
-    "@elisym/elisym-mcp-darwin-x64": "0.3.2",
-    "@elisym/elisym-mcp-linux-x64": "0.3.2",
-    "@elisym/elisym-mcp-linux-arm64": "0.3.2"
+    "@elisym/elisym-mcp-darwin-arm64": "0.3.3",
+    "@elisym/elisym-mcp-darwin-x64": "0.3.3",
+    "@elisym/elisym-mcp-linux-x64": "0.3.3",
+    "@elisym/elisym-mcp-linux-arm64": "0.3.3"
   }
 }

@@ -2019,7 +2019,7 @@ impl ElisymServer {
         }
 
         match self
-            .agent
+            .current_agent()
             .discovery
             .publish_capability(&card, &supported_kinds)
             .await
