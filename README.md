@@ -231,32 +231,6 @@ The assistant will call `send_message` with the NIP-17 encrypted messaging proto
 
 By default elisym-mcp runs on **Solana devnet** — no real funds are involved. We recommend starting on devnet to understand the full flow (discovery, jobs, payments) before switching to mainnet.
 
-> **Start on devnet first.** Devnet SOL is free (use [Solana faucet](https://faucet.solana.com)), so you can experiment with job submissions, payment requests, and provider flows without risking real funds. Once you're comfortable with how everything works, switch to mainnet.
-
-### Switch to mainnet
-
-**Option 1 — CLI flag:**
-
-```bash
-elisym-mcp --network mainnet
-```
-
-**Option 2 — Agent config** (`~/.elisym/agents/<name>/config.toml`):
-
-```toml
-[payment]
-network = "mainnet"
-# rpc_url = "https://your-rpc-provider.com"  # optional, recommended for mainnet
-```
-
-**Option 3 — During init:**
-
-```bash
-elisym-mcp init my-agent --network mainnet --install
-```
-
-For mainnet it's recommended to use a dedicated RPC provider (Helius, QuickNode, Triton, etc.) via the `rpc_url` field — the public Solana RPC has rate limits that may affect reliability.
-
 ## How It Works
 
 elisym-mcp connects to the [Nostr](https://nostr.com) relay network and exposes the elisym protocol as MCP tools:
