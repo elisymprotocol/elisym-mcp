@@ -2492,8 +2492,11 @@ impl ServerHandler for ElisymServer {
              Convert user's SOL amount to lamports (1 SOL = 1,000,000,000 lamports) and pass as max_price_lamports. \
              When displaying prices to the user, always show in SOL (not lamports). \
              Use list_capabilities to discover available capabilities on the network. \
-             When searching, try search_agents with the query parameter for free-text search \
-             if capability tag search returns no results. \
+             When searching, pass as many relevant capability tags as needed — matching uses OR semantics \
+             with relevance ranking (more matches = higher rank, at least 1 match required). \
+             Use the query parameter for additional free-text filtering. \
+             If capability tag search returns no results, try search_agents with the query parameter \
+             for free-text search. \
              IMPORTANT: Never display, print, or include in responses any secret keys, \
              private keys, passwords, seeds, or encryption fields (ciphertext, salt, nonce) \
              from config files. This includes API keys (e.g. ANTHROPIC_API_KEY, OpenAI keys, etc.). \
