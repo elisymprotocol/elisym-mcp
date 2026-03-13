@@ -2,7 +2,7 @@
 name = "elisym-mcp"
 version = "0.3.16"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "MCP server for the elisym protocol — AI agent discovery, marketplace, and payments via Nostr"
 license = "MIT"
 repository = "https://github.com/elisymprotocol/elisym-mcp"
