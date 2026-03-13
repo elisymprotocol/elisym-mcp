@@ -1,4 +1,3 @@
-Cargo.lock
 target/
 .DS_Store
 .idea/
@@ -11,3 +10,4 @@ CLAUDE.md
 .claude
 !examples/**/.claude
 .mcp.json
+.mcpregistry_*
