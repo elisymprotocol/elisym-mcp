@@ -239,7 +239,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   npm:
     name: Publish npm packages
@@ -298,18 +298,32 @@ jobs:
             cd ../..
           done
 
+      - name: Sync version to server.json and npm/package.json
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          node -e "
+            const fs = require('fs');
+            // Update server.json
+            const server = JSON.parse(fs.readFileSync('server.json', 'utf8'));
+            server.version = '${VERSION}';
+            if (server.packages) {
+              for (const pkg of server.packages) {
+                pkg.version = '${VERSION}';
+              }
+            }
+            fs.writeFileSync('server.json', JSON.stringify(server, null, 2) + '\n');
+            // Update npm/package.json
+            const npm = JSON.parse(fs.readFileSync('npm/package.json', 'utf8'));
+            npm.version = '${VERSION}';
+            for (const dep of Object.keys(npm.optionalDependencies || {})) {
+              npm.optionalDependencies[dep] = '${VERSION}';
+            }
+            fs.writeFileSync('npm/package.json', JSON.stringify(npm, null, 2) + '\n');
+          "
+
       - name: Publish wrapper package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm
-          VERSION="${{ needs.check-version.outputs.version }}"
-          node -e "
-            const pkg = require('./package.json');
-            pkg.version = '${VERSION}';
-            for (const dep of Object.keys(pkg.optionalDependencies || {})) {
-              pkg.optionalDependencies[dep] = '${VERSION}';
-            }
-            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
           npm publish --access public || echo "Skipped wrapper (may already exist)"
