@@ -1356,6 +1356,7 @@ impl ElisymServer {
             tokio::time::Instant::now() + tokio::time::Duration::from_secs(total_timeout);
         let mut status_log = vec![format!("Job submitted. Event ID: {event_id}")];
         let mut paid = false;
+        let mut payment_tx_signature: Option<String> = None;
         let mut feedback_closed = false;
         let mut result_closed = false;
 
@@ -1450,6 +1451,7 @@ impl ElisymServer {
                                             sanitize_field(&result.payment_id, 200),
                                             sanitize_field(&result.status, 100),
                                         ));
+                                        payment_tx_signature = Some(result.payment_id.clone());
                                         paid = true;
                                         tracing::info!(event_id = %event_id, payment_id = %result.payment_id, "Payment sent, waiting for result");
 
@@ -1516,6 +1518,52 @@ impl ElisymServer {
                     };
                     let sanitized = sanitize_untrusted(&result.content, content_kind);
                     status_log.push(format!("Result received{}:\n\n{}", amount_info, sanitized.text));
+
+                    // --- Enhanced summary: balance, links ---
+                    status_log.push(String::new()); // blank line separator
+
+                    // Current balance
+                    if let Some(sol_pay) = agent.solana_payments() {
+                        let pay_agent = Arc::clone(&agent);
+                        if let Ok(Ok(lamports)) = tokio::task::spawn_blocking(move || {
+                            pay_agent.solana_payments().unwrap().balance()
+                        }).await {
+                            status_log.push(format!("💰 Current balance: {}", format_sol_short(lamports)));
+                        }
+                        // Determine Solana explorer base URL
+                        let solana_explorer_base = match sol_pay.network_name() {
+                            "mainnet" => "https://solscan.io/tx",
+                            "devnet" => "https://solscan.io/tx",
+                            _ => "https://solscan.io/tx",
+                        };
+                        let solana_cluster_param = match sol_pay.network_name() {
+                            "devnet" => "?cluster=devnet",
+                            "testnet" => "?cluster=testnet",
+                            _ => "",
+                        };
+                        // Solana transaction link
+                        if let Some(ref tx_sig) = payment_tx_signature {
+                            status_log.push(format!(
+                                "🔗 Transaction: {solana_explorer_base}/{tx_sig}{solana_cluster_param}"
+                            ));
+                        }
+                    }
+
+                    // Nostr links (njump.me)
+                    let provider_npub_str = result.provider.to_bech32().unwrap_or_default();
+                    if !provider_npub_str.is_empty() {
+                        status_log.push(format!(
+                            "🤖 Provider: https://njump.me/{provider_npub_str}"
+                        ));
+                    }
+                    status_log.push(format!(
+                        "📤 Job request: https://njump.me/{event_id}"
+                    ));
+                    let result_event_id = result.event_id;
+                    status_log.push(format!(
+                        "📥 Job result: https://njump.me/{result_event_id}"
+                    ));
+
                     return Ok(CallToolResult::success(vec![Content::text(
                         status_log.join("\n")
                     )]));
@@ -2461,6 +2509,11 @@ impl ElisymServer {
         // Update active agent
         if let Ok(mut active) = self.active_agent_name.write() {
             *active = input.name.clone();
+        }
+
+        // Persist as default so the next MCP session reuses this agent
+        if let Err(e) = crate::global_config::set_default_agent(&input.name) {
+            tracing::warn!(error = %e, "Failed to persist default_agent");
         }
 
         Ok(CallToolResult::success(vec![Content::text(format!(

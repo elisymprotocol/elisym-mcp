@@ -299,27 +299,7 @@ jobs:
           done
 
       - name: Sync version to server.json and npm/package.json
-        run: |
-          VERSION="${{ needs.check-version.outputs.version }}"
-          node -e "
-            const fs = require('fs');
-            // Update server.json
-            const server = JSON.parse(fs.readFileSync('server.json', 'utf8'));
-            server.version = '${VERSION}';
-            if (server.packages) {
-              for (const pkg of server.packages) {
-                pkg.version = '${VERSION}';
-              }
-            }
-            fs.writeFileSync('server.json', JSON.stringify(server, null, 2) + '\n');
-            // Update npm/package.json
-            const npm = JSON.parse(fs.readFileSync('npm/package.json', 'utf8'));
-            npm.version = '${VERSION}';
-            for (const dep of Object.keys(npm.optionalDependencies || {})) {
-              npm.optionalDependencies[dep] = '${VERSION}';
-            }
-            fs.writeFileSync('npm/package.json', JSON.stringify(npm, null, 2) + '\n');
-          "
+        run: bash scripts/sync-version.sh
 
       - name: Publish wrapper package
         env:

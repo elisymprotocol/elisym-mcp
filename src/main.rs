@@ -1,5 +1,6 @@
 mod agent_config;
 mod crypto;
+mod global_config;
 mod install;
 mod sanitize;
 mod server;
@@ -476,9 +477,11 @@ async fn main() -> Result<()> {
         }
         (agent_name, b)
     } else {
-        // No ELISYM_AGENT, no ELISYM_NOSTR_SECRET — auto-persist a default identity
-        let agent_name =
-            std::env::var("ELISYM_AGENT_NAME").unwrap_or_else(|_| "mcp-agent".into());
+        // No ELISYM_AGENT, no ELISYM_NOSTR_SECRET — check default_agent, then fallback
+        let agent_name = std::env::var("ELISYM_AGENT_NAME")
+            .ok()
+            .or_else(global_config::get_default_agent)
+            .unwrap_or_else(|| "mcp-agent".into());
 
         // Try loading existing config first, create if missing
         let config = match load_agent_config(&agent_name) {
