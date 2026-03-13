@@ -529,7 +529,7 @@ impl ElisymServer {
                 // Apply max price filter
                 if let Some(limit) = max_price {
                     infos.retain(|info| {
-                        info.job_price_lamports.map_or(true, |price| price <= limit)
+                        info.job_price_lamports.is_none_or(|price| price <= limit)
                     });
                 }
 
