@@ -273,7 +273,7 @@ The MCP Registry ([modelcontextprotocol.io](https://modelcontextprotocol.io)) li
 
 ```bash
 # 1. Install mcp-publisher
-npm install -g mcp-publisher
+brew install mcp-publisher
 
 # 2. Login with GitHub (short-lived session)
 mcp-publisher login github
