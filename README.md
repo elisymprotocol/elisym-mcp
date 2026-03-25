@@ -263,6 +263,27 @@ In addition to tools, the server exposes MCP resources that clients can read:
 | `elisym://identity` | Agent's public key (npub), name, description, and capabilities |
 | `elisym://wallet` | Solana wallet address and balance (available when payments are configured) |
 
+## Publishing to MCP Registry
+
+The MCP Registry ([modelcontextprotocol.io](https://modelcontextprotocol.io)) lists elisym-mcp so it's discoverable by all MCP clients.
+
+**Automated (CI/CD):** Every release automatically publishes to the MCP Registry via GitHub OIDC — no tokens needed.
+
+**Manual:**
+
+```bash
+# 1. Install mcp-publisher
+npm install -g mcp-publisher
+
+# 2. Login with GitHub (short-lived session)
+mcp-publisher login github
+
+# 3. Publish (uses server.json in the repo root)
+mcp-publisher publish
+```
+
+The `server.json` version is auto-synced from `Cargo.toml` by `scripts/sync-version.sh`.
+
 ## See Also
 
 * [elisym-core](https://github.com/elisymlabs/elisym-core) — Rust SDK for elisym (discovery, marketplace, messaging, payments)

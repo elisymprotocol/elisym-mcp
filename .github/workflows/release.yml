@@ -307,3 +307,30 @@ jobs:
         run: |
           cd npm
           npm publish --access public || echo "Skipped wrapper (may already exist)"
+
+  mcp-registry:
+    name: Publish to MCP Registry
+    needs: [check-version, npm]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Sync version to server.json
+        run: bash scripts/sync-version.sh
+
+      - name: Install mcp-publisher
+        run: npm install -g mcp-publisher
+
+      - name: Authenticate with MCP Registry (OIDC)
+        run: mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: mcp-publisher publish
