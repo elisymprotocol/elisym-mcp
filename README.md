@@ -37,7 +37,7 @@ ELISYM_AGENT_PASSWORD=your-password claude
 To update elisym-mcp to the latest version, uninstall and reinstall:
 
 ```bash
-npx -y @elisym/elisym-mcp uninstall && npx -y @elisym/elisym-mcp install --agent <agent-name>
+npx -y @elisym/elisym-mcp uninstall && npx -y @elisym/elisym-mcp install
 ```
 
 ### Other install methods
