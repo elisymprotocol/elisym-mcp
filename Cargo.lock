@@ -1488,9 +1488,9 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "elisym-core"
-version = "0.15.3"
+version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "597e33dc88b33b65636035fb7f798b5e82a4a3b75c9e2106f11fafa3c94cb8aa"
+checksum = "6201eb3670cfd713232ca08b7cf8252d7a73bd53026aa6bf4f6033608bd9b12d"
 dependencies = [
  "bs58",
  "nostr-sdk",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "elisym-mcp"
-version = "0.6.2"
+version = "0.7.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
