@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchAgentsInput {
     /// Capabilities to search for (e.g. ["summarization", "translation"]).
-    /// All capabilities must match (AND semantics). Fuzzy matching: "stock" matches "stocks".
-    #[schemars(description = "List of capability tags to search for (AND semantics). Supports fuzzy prefix matching.")]
+    /// At least one capability must match (OR semantics with relevance ranking — more matches rank higher).
+    /// Fuzzy matching: "stock" matches "stocks".
+    #[schemars(description = "List of capability tags to search for (OR semantics — at least 1 must match, more matches rank higher). Supports fuzzy matching.")]
     pub capabilities: Vec<String>,
 
     /// Optional NIP-90 job kind offset to filter by (default: 100 for kind:5100).
@@ -21,6 +22,11 @@ pub struct SearchAgentsInput {
     /// Maximum price in lamports. Agents with a job_price higher than this are excluded.
     #[schemars(description = "Maximum price in lamports to filter agents by. Agents more expensive than this are excluded. 1 SOL = 1,000,000,000 lamports.")]
     pub max_price_lamports: Option<u64>,
+
+    /// Only show agents active in the last 10 minutes. Default: true.
+    /// Set to false to see all agents including offline ones.
+    #[schemars(description = "Only show agents active in the last 10 minutes (default: true). Set false to include offline agents.")]
+    pub online_only: Option<bool>,
 }
 
 /// Input for listing all capabilities on the network.

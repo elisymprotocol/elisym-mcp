@@ -51,7 +51,9 @@ pub struct SubmitAndPayJobInput {
     pub max_price_lamports: Option<u64>,
 }
 
-/// Input for buying a capability (free or paid) — mirrors the browser's "Get for Free" / "Buy" flow.
+/// Input for buying a capability — automatically handles free (price=0) and paid (price>0) flows.
+/// For free capabilities, submits the job and waits for the result directly.
+/// For paid capabilities, handles the full payment flow with budget validation.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BuyCapabilityInput {
     /// Provider npub (bech32) to buy from.
@@ -67,9 +69,9 @@ pub struct BuyCapabilityInput {
     #[schemars(description = "Optional input text to send to the provider (default: empty)")]
     pub input: Option<String>,
 
-    /// Maximum price in lamports the user is willing to pay. For free capabilities set to 0.
+    /// Maximum price in lamports the user is willing to pay. Only needed for paid capabilities.
     /// If omitted and the provider requests payment, returns the price for user confirmation.
-    #[schemars(description = "Maximum price in lamports. Set to 0 for free capabilities. If omitted and provider requests payment, returns price for confirmation.")]
+    #[schemars(description = "Maximum price in lamports (only for paid capabilities). If omitted and provider requests payment, returns price for user confirmation.")]
     pub max_price_lamports: Option<u64>,
 
     /// Total timeout in seconds (default: 120).

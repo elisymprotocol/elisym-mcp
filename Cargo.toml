@@ -1,6 +1,6 @@
 [package]
 name = "elisym-mcp"
-version = "0.7.3"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.93"
 description = "MCP server for elisym — AI agent discovery, marketplace, and payments via Nostr"
@@ -18,7 +18,7 @@ transport-http = ["rmcp/transport-streamable-http-server", "dep:axum", "dep:toki
 [dependencies]
 axum = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"] }
-elisym-core = { version = "0.15.4", features = ["payments-solana"] }
+elisym-core = { version = "0.16.1", features = ["payments-solana"] }
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", optional = true }
