@@ -27,10 +27,10 @@ pub struct SearchAgentsInput {
     #[schemars(description = "Maximum price in lamports to filter agents by. Agents more expensive than this are excluded. 1 SOL = 1,000,000,000 lamports.")]
     pub max_price_lamports: Option<u64>,
 
-    /// Only show agents active in the last 10 minutes. Default: true.
+    /// Only show agents active in the last 11 minutes. Default: true.
     /// Set to false to see all agents including offline ones.
     #[serde(default = "default_online_only")]
-    #[schemars(description = "Only show agents active in the last 10 minutes (default: true). Set false to include offline agents.")]
+    #[schemars(description = "Only show agents active in the last 11 minutes. Default: true. Set false to include offline agents.", default = "default_online_only")]
     pub online_only: bool,
 }
 
